@@ -1,0 +1,13 @@
+# ByteTrack config for the YOLO camera node (Ultralytics defaults, except track_buffer).
+# Docs: https://docs.ultralytics.com/modes/track
+
+tracker_type: bytetrack
+track_high_thresh: 0.25 # first-stage match threshold
+track_low_thresh: 0.1 # second-stage threshold for low-score matches
+new_track_thresh: 0.25 # start a new track if no match is at least this
+# Processed frames a lost track is kept before ByteTrack forgets its ID.
+# Set to about stale_timeout x FPS. The node logs its FPS and a suggested
+# value every 5 s, so copy that number here once you know your real FPS.
+track_buffer: 45
+match_thresh: 0.8 # association similarity threshold
+fuse_score: True # fuse detection score with IoU for matching
