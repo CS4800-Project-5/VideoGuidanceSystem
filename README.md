@@ -27,6 +27,23 @@ Develop a ROS 2 perception component that detects objects of interest in a simul
 
 The Product Owner and Scrum Master roles may rotate between sprints.
 
+## Target hardware
+
+Development and testing happen in the PX4 + Gazebo simulation. The component is meant to run eventually on this hardware, as specified by the instructor:
+
+| Component | Details |
+| --- | --- |
+| Onboard computer | [NVIDIA Jetson Orin Nano Super Developer Kit](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/nano-super-developer-kit/): ARM64 with an NVIDIA GPU; JetPack 6 is based on Ubuntu 22.04, which matches ROS 2 Humble |
+| Camera | Stereolabs ZED stereo camera (RGB + depth): [ZED SDK](https://www.stereolabs.com/developers/release) |
+| ROS 2 camera driver | [zed-ros2-wrapper](https://github.com/stereolabs/zed-ros2-wrapper) |
+
+The current code targets the simulation only. Before it can run on the hardware:
+
+- [ ] Make the camera topic a ROS parameter (it is hardcoded to the Gazebo topic) so it can subscribe to the ZED wrapper's image topic.
+- [ ] Make the inference device a parameter (it is hardcoded to `cpu`) so YOLO can use the Jetson's GPU; consider a TensorRT export for speed.
+- [ ] Make the OpenCV display window optional, because the drone runs without a monitor.
+- [ ] Write and test Jetson setup steps. The x86 install in [Setup](#setup) does not apply: the Jetson needs NVIDIA's PyTorch builds, and the ZED SDK needs a real NVIDIA GPU, so it cannot be tested in a VM.
+
 ## How it works
 
 ```
