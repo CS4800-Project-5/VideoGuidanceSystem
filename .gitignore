@@ -1,0 +1,5 @@
+# Python bytecode
+__pycache__/
+
+# YOLO weights (ultralytics downloads them on first run)
+*.pt

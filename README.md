@@ -71,29 +71,97 @@ yolo_camera_node.py
 
 ## Setup
 
-Runs on Ubuntu with **ROS 2 Humble**. The launch file expects these in your home directory:
+Runs on **Ubuntu 22.04** with **ROS 2 Humble** and **Gazebo Harmonic**. The launch file expects these in your home directory:
 
 | Path | What it is |
 | --- | --- |
 | `~/PX4-Autopilot` | PX4 source, built for SITL with Gazebo |
 | `~/yolo_ros2_env` | Python virtual environment with `ultralytics` and `opencv-python` |
-| `~/yolo_camera_node.py` | The node the launch file runs (see note below) |
+| `~/yolo_camera_node.py` | Symlink to the node in this repo (step 4) |
 | `~/Downloads/QGroundControl-4.4.3.AppImage` | Optional; run `chmod +x` on it once |
 
-ROS packages used: `ros_gz_image`, `image_tools`, `mavros` (optional), and `rosbag2`.
+### 1. ROS 2 packages
 
-> **Note:** `sim.launch.py` runs `~/yolo_camera_node.py`, not the copy in this repo. After you edit the repo version, copy it to your home directory or symlink it once:
-> ```bash
-> ln -sf "$(pwd)/yolo_camera_node.py" ~/yolo_camera_node.py
-> ```
-> Keep `bytetrack_occlusion.yaml` next to whichever copy runs, because the node looks for it in its own folder.
+Install ROS 2 Humble (`ros-humble-desktop`), Gazebo Harmonic, and PX4 (built with `make px4_sitl`) first by following their official guides. Then install:
+
+```bash
+sudo apt update
+sudo apt install ros-humble-ros-gzharmonic ros-humble-image-tools ros-humble-rosbag2 \
+                 ros-humble-mavros ros-humble-mavros-extras python3.10-venv
+sudo /opt/ros/humble/lib/mavros/install_geographiclib_datasets.sh   # only needed for mavros:=true
+```
+
+Use `ros-humble-ros-gzharmonic`, **not** `ros-humble-ros-gz`. The plain package is built for Gazebo Fortress and conflicts with Harmonic. It comes from the OSRF apt repo that the Gazebo Harmonic install sets up.
+
+### 2. Python environment for YOLO
+
+```bash
+python3 -m venv --system-site-packages ~/yolo_ros2_env
+~/yolo_ros2_env/bin/pip install --upgrade pip
+# CPU-only PyTorch: the node runs YOLO on the CPU, and this skips a multi-GB CUDA download
+~/yolo_ros2_env/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+~/yolo_ros2_env/bin/pip install ultralytics opencv-python "numpy<2"
+```
+
+Keep the `numpy<2` pin. Humble's `cv_bridge` is built against NumPy 1.x, and ultralytics would otherwise install NumPy 2, which breaks it. The `yolov8n.pt` weights and the `lap` package download automatically the first time the node runs.
+
+If `venv` fails with "ensurepip is not available", install `python3.10-venv`, run `rm -rf ~/yolo_ros2_env`, and create the environment again.
+
+### 3. Person model for the test scenarios
+
+```bash
+gz fuel download -u https://fuel.gazebosim.org/1.0/OpenRobotics/models/scrubs/2
+ls ~/.gz/fuel/fuel.gazebosim.org/openrobotics/models/scrubs/2/model.sdf   # must exist
+```
+
+### 4. Link the node into your home directory
+
+`sim.launch.py` runs `~/yolo_camera_node.py`, not the copy in this repo. Symlink it once so your edits take effect:
+
+```bash
+ln -sf ~/VideoGuidanceSystem/yolo_camera_node.py ~/yolo_camera_node.py
+```
+
+The node follows the symlink and loads `bytetrack_occlusion.yaml` from the repo folder. If you copy the file instead of linking it, copy the YAML next to it too.
+
+### 5. Check the install
+
+```bash
+source /opt/ros/humble/setup.bash
+ros2 pkg prefix ros_gz_image          # should print /opt/ros/humble
+~/yolo_ros2_env/bin/python -c "import rclpy, cv_bridge, ultralytics, cv2; print('ok')"
+```
+
+### Running in a VMware (or other) virtual machine
+
+Gazebo's 3D rendering crashes on VMware's virtual graphics adapter. The Gazebo window opens and closes within a couple of seconds, and Ubuntu shows a crash report for `ruby` or `ros2`. Always launch with software rendering:
+
+```bash
+ros2 launch ./sim.launch.py software_render:=true
+```
+
+Gazebo then renders on the CPU. It runs slower (a real-time factor around 35% is normal), but it is stable. If the window still closes on a Wayland session, also force X11 for Qt:
+
+```bash
+QT_QPA_PLATFORM=xcb ros2 launch ./sim.launch.py software_render:=true
+```
+
+Run `systemd-detect-virt` to check whether you are in a VM (it prints `vmware`, `oracle`, and so on, or `none`).
+
+### Troubleshooting
+
+- **`'./sim.launch.py' is not a valid package name`:** you are not in the repo folder. Run `cd ~/VideoGuidanceSystem` first, or pass the full path to the launch file.
+- **`PX4 server already running for instance 0`:** a previous run is still alive. Stop it with Ctrl+C in its terminal, or run `pkill -x px4`, then launch again.
+- **`Preflight Fail: No connection to the GCS`:** harmless. PX4 is reporting that QGroundControl isn't running. Add `qgc:=true` if you need it.
+- **Ubuntu "application has stopped unexpectedly" popups** can be left over from an earlier failed run. Click **Don't send**.
 
 ## Usage
 
 ```bash
 source /opt/ros/humble/setup.bash
+cd ~/VideoGuidanceSystem   # ./sim.launch.py is a relative path
 
-# Default: PX4 + Gazebo + image bridge + YOLO node
+# Default: PX4 + Gazebo + image bridge + YOLO node (add software_render:=true in a VM)
 ros2 launch ./sim.launch.py
 
 # Optional extras
