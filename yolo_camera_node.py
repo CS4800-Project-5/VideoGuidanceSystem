@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import os
 import time
 
@@ -9,13 +10,25 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 from ultralytics import YOLO
+from vision_msgs.msg import (
+    Detection2D,
+    Detection2DArray,
+    ObjectHypothesisWithPose,
+)
 
 
 CAMERA_TOPIC = (
     "/world/default/model/x500_mono_cam_0/"
     "link/camera_link/sensor/camera/image"
 )
+
+# Output topics. See docs/ros_interfaces.md for the message contents.
+DETECTIONS_TOPIC = "/perception/detections"
+TRACKS_TOPIC = "/perception/tracks"
+TRACK_EVENTS_TOPIC = "/perception/track_events"
+ANNOTATED_IMAGE_TOPIC = "/perception/image_annotated"
 
 # The tracker config sits next to this file in the repo, so the path works on any machine.
 TRACKER_CONFIG = os.path.join(
@@ -51,6 +64,21 @@ class YoloCameraNode(Node):
             self.image_callback,
             qos_profile_sensor_data,
         )
+
+        # Publishers for other teams (path planning, logging, analysis).
+        self.detections_pub = self.create_publisher(
+            Detection2DArray, DETECTIONS_TOPIC, 10
+        )
+        self.tracks_pub = self.create_publisher(
+            Detection2DArray, TRACKS_TOPIC, 10
+        )
+        self.events_pub = self.create_publisher(
+            String, TRACK_EVENTS_TOPIC, 10
+        )
+        self.annotated_pub = self.create_publisher(
+            Image, ANNOTATED_IMAGE_TOPIC, qos_profile_sensor_data
+        )
+        self.last_header = None        # header of the most recent processed image
 
         # If the camera stops sending images, image time stops moving and
         # tracks would never go stale. This timer catches that case.
@@ -107,6 +135,7 @@ class YoloCameraNode(Node):
                     self.get_logger().info(
                         f"Object entered camera view: ID {track_id}"
                     )
+                    self.publish_event("entered", track_id, stamp)
 
                 self.last_seen[track_id] = stamp
 
@@ -117,9 +146,22 @@ class YoloCameraNode(Node):
                         f"Object left camera view: ID {track_id} "
                         f"(unseen for {stamp - seen_at:.1f}s)"
                     )
+                    self.publish_event(
+                        "left", track_id, stamp,
+                        reason=f"unseen for {stamp - seen_at:.1f}s",
+                    )
                     del self.last_seen[track_id]
 
+            self.last_header = message.header
+            self.publish_detections(results[0], message.header)
+
             detected_image = results[0].plot()
+            if self.annotated_pub.get_subscription_count() > 0:
+                annotated = self.bridge.cv2_to_imgmsg(
+                    detected_image, encoding="bgr8"
+                )
+                annotated.header = message.header
+                self.annotated_pub.publish(annotated)
             cv2.imshow(
                 "PX4 Camera - YOLO Tracking",
                 detected_image,
@@ -143,7 +185,66 @@ class YoloCameraNode(Node):
             self.get_logger().info(
                 f"Object left camera view: ID {track_id} ({reason})"
             )
+            self.publish_event("left", track_id, self.last_stamp, reason=reason)
         self.last_seen.clear()
+
+    def publish_detections(self, result, header):
+        """Publish every detection, and separately the ones with a track ID."""
+        detections = Detection2DArray(header=header)
+        tracks = Detection2DArray(header=header)
+
+        boxes = result.boxes
+        if boxes is not None and len(boxes) > 0:
+            xywh = boxes.xywh.cpu().tolist()
+            confidences = boxes.conf.cpu().tolist()
+            class_ids = boxes.cls.int().cpu().tolist()
+            track_ids = (
+                boxes.id.int().cpu().tolist()
+                if boxes.id is not None
+                else [None] * len(xywh)
+            )
+
+            for (cx, cy, w, h), conf, cls, tid in zip(
+                xywh, confidences, class_ids, track_ids
+            ):
+                detection = Detection2D(header=header)
+                detection.id = "" if tid is None else str(tid)
+
+                # Pixel coordinates in the camera image.
+                center = detection.bbox.center
+                if hasattr(center, "position"):   # vision_msgs 4.x (Humble)
+                    center.position.x = float(cx)
+                    center.position.y = float(cy)
+                else:                              # older vision_msgs
+                    center.x = float(cx)
+                    center.y = float(cy)
+                detection.bbox.size_x = float(w)
+                detection.bbox.size_y = float(h)
+
+                hypothesis = ObjectHypothesisWithPose()
+                hypothesis.hypothesis.class_id = str(result.names[cls])
+                hypothesis.hypothesis.score = float(conf)
+                detection.results.append(hypothesis)
+
+                detections.detections.append(detection)
+                if tid is not None:
+                    tracks.detections.append(detection)
+
+        # Published every processed frame, even when empty, so subscribers
+        # can tell "nothing in view" apart from "node is not running".
+        self.detections_pub.publish(detections)
+        self.tracks_pub.publish(tracks)
+
+    def publish_event(self, event, track_id, stamp, reason=""):
+        """Publish an entry/exit event as a small JSON string."""
+        payload = {
+            "event": event,
+            "track_id": int(track_id),
+            "stamp": round(float(stamp), 3) if stamp is not None else None,
+        }
+        if reason:
+            payload["reason"] = reason
+        self.events_pub.publish(String(data=json.dumps(payload)))
 
     def reset_tracker(self):
         # Clear ByteTrack's memory so old IDs cannot come back. IDs restart at 1.

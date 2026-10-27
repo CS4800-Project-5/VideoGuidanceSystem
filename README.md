@@ -57,7 +57,8 @@ yolo_camera_node.py
   ├─ YOLOv8n detection (person class)
   ├─ ByteTrack persistent IDs (bytetrack_occlusion.yaml)
   ├─ Entry / exit / stale-track logic (stale_timeout param)
-  └─ OpenCV window with boxes, labels, confidences, IDs
+  ├─ OpenCV window with boxes, labels, confidences, IDs
+  └─ Publishes /perception/{detections,tracks,track_events,image_annotated}
 ```
 
 | File | Purpose |
@@ -74,13 +75,13 @@ yolo_camera_node.py
 | Accept simulated camera images through ROS 2 | ✅ Done |
 | Obtain UAV pose/state from PX4 through MAVROS | 🟡 MAVROS can be launched; the node does not use it yet |
 | Detect objects of specified target classes | 🟡 Person class only (`classes=[0]`); not yet configurable |
-| Bounding box, class label, and confidence per detection | 🟡 Shown in the visualization; not published |
+| Bounding box, class label, and confidence per detection | ✅ Published on `/perception/detections` |
 | Assign persistent IDs | ✅ ByteTrack |
 | Associate detections with existing tracks across frames | ✅ ByteTrack |
 | Handle objects entering and leaving the view | ✅ Logged as entry/exit events |
 | Handle temporary loss or occlusion | ✅ `track_buffer` keeps IDs through short occlusions |
 | Remove stale tracks after a configurable period | ✅ `stale_timeout` ROS parameter (default 3.0 s) |
-| Publish detections and tracks through documented ROS 2 interfaces | ❌ Not started |
+| Publish detections and tracks through documented ROS 2 interfaces | ✅ See [docs/ros_interfaces.md](docs/ros_interfaces.md) |
 | Visualize boxes, classes, confidences, and IDs | ✅ OpenCV window |
 | Log detection and tracking results for analysis | 🟡 ROS logs + optional rosbag; no structured log yet |
 | Measure performance (accuracy, track continuity, latency, FPS) | ❌ Not started |
@@ -104,7 +105,7 @@ Install ROS 2 Humble (`ros-humble-desktop`), Gazebo Harmonic, and PX4 (built wit
 ```bash
 sudo apt update
 sudo apt install ros-humble-ros-gzharmonic ros-humble-image-tools ros-humble-rosbag2 \
-                 ros-humble-mavros ros-humble-mavros-extras python3.10-venv
+                 ros-humble-mavros ros-humble-mavros-extras ros-humble-vision-msgs python3.10-venv
 sudo /opt/ros/humble/lib/mavros/install_geographiclib_datasets.sh   # only needed for mavros:=true
 ```
 
@@ -146,7 +147,7 @@ The node follows the symlink and loads `bytetrack_occlusion.yaml` from the repo 
 ```bash
 source /opt/ros/humble/setup.bash
 ros2 pkg prefix ros_gz_image          # should print /opt/ros/humble
-~/yolo_ros2_env/bin/python -c "import rclpy, cv_bridge, ultralytics, cv2; print('ok')"
+~/yolo_ros2_env/bin/python -c "import rclpy, cv_bridge, ultralytics, cv2, vision_msgs; print('ok')"
 ```
 
 ### Running in a VMware (or other) virtual machine
