@@ -39,9 +39,9 @@ Development and testing happen in the PX4 + Gazebo simulation. The component is 
 
 The current code targets the simulation only. Before it can run on the hardware:
 
-- [ ] Make the camera topic a ROS parameter (it is hardcoded to the Gazebo topic) so it can subscribe to the ZED wrapper's image topic.
+- [x] Make the camera topic a ROS parameter (`camera_topic`) so it can subscribe to the ZED wrapper's image topic. Tested with the real ZED on a laptop, see [Real ZED camera on a laptop](#real-zed-camera-on-a-laptop).
 - [ ] Make the inference device a parameter (it is hardcoded to `cpu`) so YOLO can use the Jetson's GPU; consider a TensorRT export for speed.
-- [ ] Make the OpenCV display window optional, because the drone runs without a monitor.
+- [x] Make the OpenCV display window optional (`show_window:=false`), because the drone runs without a monitor.
 - [ ] Write and test Jetson setup steps. The x86 install in [Setup](#setup) does not apply: the Jetson needs NVIDIA's PyTorch builds, and the ZED SDK needs a real NVIDIA GPU, so it cannot be tested in a VM.
 
 ## How it works
@@ -66,6 +66,8 @@ yolo_camera_node.py
 | `yolo_camera_node.py` | ROS 2 node that detects and tracks objects and logs when objects enter or leave the view. |
 | `bytetrack_occlusion.yaml` | ByteTrack settings. `track_buffer` controls how long a hidden object keeps its ID. |
 | `scenario.py` | Repeatable Gazebo test scenarios (entry/exit and occlusion) driven by the `gz` CLI. |
+| `zed.launch.py` | The real ZED camera on a laptop: camera + YOLO node, with each person's distance. |
+| `setup_zed.sh` | One-time setup for `zed.launch.py`, and the `zed-demo` command. |
 
 ## Requirements status
 
@@ -191,6 +193,67 @@ ros2 launch ./sim.launch.py record:=true bag_name:=object_occlusion_test
 Launch arguments: `px4`, `yolo`, `mavros`, `qgc`, `viewer`, `record`, `software_render` (all `true`/`false`), and `bag_name`.
 
 Ctrl+C stops everything and closes the rosbag cleanly.
+
+## Real ZED camera on a laptop
+
+`zed.launch.py` runs the node on the real Stereolabs ZED plugged into a laptop or VM, without an
+NVIDIA GPU. The camera is read by `zed_usb_publisher.py` from another team's repo,
+[ArnavSingh121/Proj_1](https://github.com/ArnavSingh121/Proj_1/tree/main/zed_usb) (credit to them;
+it is not copied into this repo). It reads the ZED as a plain USB camera, computes depth on the CPU
+and publishes the same topics as the ZED ROS 2 wrapper on the Jetson:
+
+| Topic | What |
+| --- | --- |
+| `/zed/zed_node/rgb/color/rect/image` | Color image (the node's `camera_topic`) |
+| `/zed/zed_node/depth/depth_registered` | Depth in meters, pixel-aligned with the color image (`depth_topic`) |
+
+With a depth topic, the node shows each person's distance (median depth over their torso; `? m`
+where stereo depth has a hole).
+
+**Setup, once, with internet and the ZED plugged in:**
+
+```bash
+cd ~/VideoGuidanceSystem
+bash setup_zed.sh
+```
+
+It clones Proj_1 to `~/Proj_1` (for the camera code), adds `lap` to `~/yolo_ros2_env` (ByteTrack
+needs it; otherwise it is downloaded on first run), saves `yolov8n.pt` in the repo folder, saves the
+camera's factory calibration, turns off USB autosuspend for the ZED, and adds the `zed-demo` command.
+After that, no internet is needed.
+
+**Run** (in a new terminal; you can plug the camera in after starting):
+
+```bash
+zed-demo                                  # same as: ros2 launch ./zed.launch.py
+zed-demo flip:=true                       # camera mounted upside down
+zed-demo stale_timeout:=5.0               # people keep their ID for up to 5 s out of view
+zed-demo record:=true bag_name:=zed_test  # also record color, depth and /rosout to a rosbag
+```
+
+In a VM, connect the camera to the VM first (VMware: **VM → Removable Devices → Stereolabs ZED →
+Connect**). `zed-demo` keeps ROS 2 on this computer (`ROS_LOCALHOST_ONLY=1`) so other groups' topics
+on a shared network don't mix in; run `export ROS_LOCALHOST_ONLY=1` in other terminals to see the
+topics, or launch with `localhost_only:=false`.
+
+**IDs through short gaps:** ByteTrack keeps a hidden person's ID for `track_buffer` processed frames.
+The node now sets that from `stale_timeout` and the measured frame rate, so a person who leaves the
+view and comes back within `stale_timeout` seconds keeps their ID on any machine (sim, laptop or
+Jetson). After longer they are logged as left and come back with a new ID.
+
+**Expect** a few frames per second: the CPU computes both the stereo depth and YOLO. Depth has holes
+on plain walls and ceilings.
+
+New node parameters (defaults keep the simulation behavior unchanged):
+
+| Parameter | Default | ZED launch |
+| --- | --- | --- |
+| `camera_topic` | Gazebo camera topic | `/zed/zed_node/rgb/color/rect/image` |
+| `depth_topic` | empty (no distances) | `/zed/zed_node/depth/depth_registered` |
+| `camera_qos` | `sensor_data` | `reliable` (best effort drops the ZED's ~1 MB images) |
+| `process_every` | `3` | `1` |
+| `imgsz` | `320` | `640` |
+| `show_window` | `true` | `true` (`false` on the drone) |
 
 ## Testing
 
