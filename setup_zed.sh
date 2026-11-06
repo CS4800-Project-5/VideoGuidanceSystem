@@ -74,8 +74,9 @@ step "YOLO model (saved in the repo folder, so no download is needed later)"
 (cd "$HERE" && "$VENV/bin/python" -c "
 from ultralytics import YOLO
 import numpy as np
-YOLO('yolov8n.pt').track(np.zeros((376, 672, 3), np.uint8), persist=True,
-                          tracker='bytetrack_occlusion.yaml', verbose=False)
+for tracker in ('bytetrack_occlusion.yaml', 'botsort_zed.yaml'):
+    YOLO('yolov8n.pt').track(np.zeros((376, 672, 3), np.uint8), persist=True,
+                              tracker=tracker, verbose=False)
 print('ok: yolov8n.pt and the tracker work')
 ")
 

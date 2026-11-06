@@ -1,0 +1,24 @@
+# BoT-SORT config for the real ZED camera (zed.launch.py). Ultralytics defaults, except as noted.
+# Docs: https://docs.ultralytics.com/modes/track
+#
+# Why not bytetrack_occlusion.yaml here: ByteTrack assumes the camera holds still. A handheld
+# camera (or the drone) moving at a few frames per second shifts everyone far between frames, so
+# ByteTrack loses them and starts new IDs. BoT-SORT's global motion compensation (gmc_method)
+# estimates the camera's own motion from the background and corrects for it.
+
+tracker_type: botsort
+track_high_thresh: 0.25 # first-stage match threshold
+track_low_thresh: 0.1 # second-stage threshold: weak detections keep existing tracks alive
+new_track_thresh: 0.4 # start a new ID only for a fairly confident detection (default 0.25)
+# Processed frames a lost track is kept. The node replaces this with stale_timeout x the
+# measured FPS, so change stale_timeout, not this value.
+track_buffer: 30
+match_thresh: 0.8 # association similarity threshold
+fuse_score: True # fuse detection score with IoU for matching
+
+# BoT-SORT specifics
+gmc_method: sparseOptFlow # camera motion compensation: sparseOptFlow | orb | sift | ecc | none
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False
+model: auto

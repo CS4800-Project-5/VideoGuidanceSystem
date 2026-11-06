@@ -90,6 +90,11 @@ def launch_setup(context):
                  "-p", "process_every:=1",
                  # 672x376 images: 640 keeps people small in the image (far away) detectable.
                  "-p", "imgsz:=640",
+                 # Handheld camera: BoT-SORT compensates for the camera's own motion; weak
+                 # detections keep partly hidden people tracked; an ID only after 3 frames in a row.
+                 "-p", f"tracker:={os.path.join(HERE, 'botsort_zed.yaml')}",
+                 "-p", "conf:=0.1",
+                 "-p", ["min_hits:=", LaunchConfiguration("min_hits")],
                  "-p", ["stale_timeout:=", stale_timeout],
                  "-p", ["show_window:=", show_window]],
             # yolov8n.pt is loaded from the repo folder (setup_zed.sh downloads it there), so no
@@ -115,6 +120,8 @@ def generate_launch_description():
                               description="'true' if the camera is mounted upside down"),
         DeclareLaunchArgument("stale_timeout", default_value="3.0",
                               description="Seconds a person can be out of view and keep their ID"),
+        DeclareLaunchArgument("min_hits", default_value="3",
+                              description="Frames in a row a person must be tracked before getting an ID"),
         DeclareLaunchArgument("show_window", default_value="true",
                               description="Show the OpenCV window with boxes, IDs and distances"),
         DeclareLaunchArgument("record", default_value="false",
