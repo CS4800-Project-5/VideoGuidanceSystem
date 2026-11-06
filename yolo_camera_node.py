@@ -64,6 +64,26 @@ class YoloCameraNode(Node):
         # Run YOLO on one out of every `process_every` frames to reduce CPU usage.
         self.process_every = max(1, int(self.declare_parameter("process_every", 3).value))
         self.imgsz = int(self.declare_parameter("imgsz", 320).value)
+
+        # ---- Tracking ----
+        # Tracker settings file. zed.launch.py uses botsort_zed.yaml, which compensates for the
+        # camera itself moving (handheld, or on the drone).
+        self.tracker = self.declare_parameter("tracker", TRACKER_CONFIG).value
+        # Detections below this confidence are dropped before tracking. ByteTrack/BoT-SORT are
+        # designed to get weak detections too (down to track_low_thresh, 0.1): they use them only
+        # to keep following people they already track (e.g. partly hidden), and start new IDs
+        # only above new_track_thresh. The ZED launch passes 0.1.
+        self.conf = float(self.declare_parameter(
+            "conf", 0.35, ParameterDescriptor(dynamic_typing=True)).value)
+        # A person gets an ID only after being tracked in this many processed frames in a row,
+        # so detections that flicker for a frame or two don't use up IDs. IDs are numbered
+        # 1, 2, 3, ... in the order people are confirmed (the tracker's own numbers skip
+        # every short-lived candidate).
+        self.min_hits = max(1, int(self.declare_parameter("min_hits", 1).value))
+        self.display_ids = {}          # tracker id -> our id
+        self.hits = {}                 # tracker id -> processed frames tracked so far
+        self.next_display_id = 1
+
         # OpenCV window; false on the drone, which has no monitor.
         self.show_window = bool(self.declare_parameter("show_window", True).value)
         self.frame_count = 0
@@ -174,28 +194,22 @@ class YoloCameraNode(Node):
             if depth_message is not None:
                 depth = self.bridge.imgmsg_to_cv2(depth_message, desired_encoding="passthrough")
 
-            # YOLO detects people; ByteTrack assigns persistent IDs.
+            # YOLO detects people; the tracker (ByteTrack or BoT-SORT) assigns persistent IDs.
             results = self.model.track(
                 frame,
-                tracker=TRACKER_CONFIG,
+                tracker=self.tracker,
                 persist=True,
                 imgsz=self.imgsz,
-                conf=0.35,
+                conf=self.conf,
                 classes=[0],
                 device="cpu",
                 verbose=False,
             )
             self.set_track_buffer(stamp)
 
-            boxes = results[0].boxes
-            current_ids = set()
-            distances = {}   # track_id -> meters (None where depth has a hole)
-
-            if boxes is not None and boxes.id is not None:
-                current_ids = set(boxes.id.int().cpu().tolist())
-                if depth is not None:
-                    for track_id, box in zip(boxes.id.int().cpu().tolist(), boxes.xyxy.cpu().tolist()):
-                        distances[track_id] = (box, person_distance(depth, box))
+            # (our id, box, confidence, distance in m or None) for each confirmed person
+            people = self.confirmed_people(results[0].boxes, depth)
+            current_ids = {person[0] for person in people}
 
             # A newly observed ID means that an object entered the view.
             for track_id in current_ids:
@@ -214,13 +228,12 @@ class YoloCameraNode(Node):
                         f"(unseen for {stamp - seen_at:.1f}s)"
                     )
                     del self.last_seen[track_id]
+                    self.forget(track_id)
 
             if self.show_window:
-                detected_image = results[0].plot()
-                self.draw_distances(detected_image, distances)
                 cv2.imshow(
                     "YOLO Tracking (Ctrl+C in the terminal to stop)",
-                    detected_image,
+                    self.draw(frame, people, depth is not None),
                 )
                 cv2.waitKey(1)
 
@@ -229,16 +242,57 @@ class YoloCameraNode(Node):
                 f"Image processing error: {error}"
             )
 
+    def confirmed_people(self, boxes, depth):
+        """The tracker's results with our IDs: only people tracked for min_hits frames in a row."""
+        people = []
+        seen = set()
+        if boxes is not None and boxes.id is not None:
+            for tracker_id, box, confidence in zip(
+                boxes.id.int().cpu().tolist(), boxes.xyxy.cpu().tolist(), boxes.conf.cpu().tolist()
+            ):
+                seen.add(tracker_id)
+                self.hits[tracker_id] = self.hits.get(tracker_id, 0) + 1
+                if tracker_id not in self.display_ids:
+                    if self.hits[tracker_id] < self.min_hits:
+                        continue
+                    self.display_ids[tracker_id] = self.next_display_id
+                    self.next_display_id += 1
+                meters = person_distance(depth, box) if depth is not None else None
+                people.append((self.display_ids[tracker_id], box, confidence, meters))
+        # Candidates must be seen in consecutive frames to count.
+        for tracker_id in list(self.hits):
+            if tracker_id not in seen and tracker_id not in self.display_ids:
+                del self.hits[tracker_id]
+        return people
+
+    def forget(self, display_id):
+        """Drop the tracker ids behind one of our ids once it has gone stale."""
+        for tracker_id in [t for t, d in self.display_ids.items() if d == display_id]:
+            del self.display_ids[tracker_id]
+            self.hits.pop(tracker_id, None)
+
     @staticmethod
-    def draw_distances(image, distances):
-        """Distance label under the top-left corner of each person's box."""
-        for (x1, y1, _, _), meters in distances.values():
-            label = f"{meters:.1f} m" if meters is not None else "? m"
-            (width, height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            x, y = int(max(0, x1)), int(max(0, y1))
-            cv2.rectangle(image, (x, y), (x + width + 6, y + height + 8), (0, 0, 0), -1)
-            cv2.putText(image, label, (x + 3, y + height + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    def draw(frame, people, with_depth):
+        """Boxes with our IDs (one color per ID), confidence and, with depth, the distance."""
+        image = frame.copy()
+        for display_id, (x1, y1, x2, y2), confidence, meters in people:
+            hue = (display_id * 47) % 180
+            color = tuple(int(c) for c in cv2.cvtColor(
+                np.uint8([[[hue, 220, 230]]]), cv2.COLOR_HSV2BGR)[0, 0])
+            label = f"ID {display_id}  {confidence * 100:.0f}%"
+            if with_depth:
+                label += f"  {meters:.1f} m" if meters is not None else "  ? m"
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+            (width, height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            ty = max(height + 4, y1)
+            tx = max(0, min(x1, image.shape[1] - width - 4))   # keep the label inside the image
+            cv2.rectangle(image, (tx, ty - height - 4), (tx + width + 4, ty), color, -1)
+            cv2.putText(image, label, (tx + 2, ty - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(image, f"{len(people)} people", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        return image
 
     def set_track_buffer(self, stamp):
         """Keep ByteTrack's memory of a hidden object equal to stale_timeout seconds.
@@ -284,6 +338,9 @@ class YoloCameraNode(Node):
         for tracker in getattr(predictor, "trackers", None) or []:
             tracker.reset()
         self.last_processed_stamp = None
+        self.display_ids.clear()
+        self.hits.clear()
+        self.next_display_id = 1
 
 
 def main(args=None):

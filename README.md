@@ -241,6 +241,14 @@ The node now sets that from `stale_timeout` and the measured frame rate, so a pe
 view and comes back within `stale_timeout` seconds keeps their ID on any machine (sim, laptop or
 Jetson). After longer they are logged as left and come back with a new ID.
 
+**Fewer duplicate IDs with a moving camera:** with a handheld camera at a few frames per second,
+ByteTrack loses people every time the camera moves and gives them new IDs (in a 30 s test, 65 IDs for
+about 12 people). The ZED launch therefore uses BoT-SORT with camera motion compensation
+([`botsort_zed.yaml`](botsort_zed.yaml)), passes weak detections to the tracker (`conf:=0.1`) so
+partly hidden people stay tracked, and gives a person an ID only after 3 frames in a row
+(`min_hits`), so one-frame false detections don't use up IDs. IDs are numbered in order
+(1, 2, 3, ...); the tracker's own numbers skip every short-lived candidate. Same test: 23 IDs.
+
 **Expect** a few frames per second: the CPU computes both the stereo depth and YOLO. Depth has holes
 on plain walls and ceilings.
 
@@ -254,6 +262,9 @@ New node parameters (defaults keep the simulation behavior unchanged):
 | `process_every` | `3` | `1` |
 | `imgsz` | `320` | `640` |
 | `show_window` | `true` | `true` (`false` on the drone) |
+| `tracker` | `bytetrack_occlusion.yaml` | `botsort_zed.yaml` |
+| `conf` | `0.35` | `0.1` |
+| `min_hits` | `1` | `3` |
 
 ## Testing
 
