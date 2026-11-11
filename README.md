@@ -188,9 +188,21 @@ ros2 launch ./sim.launch.py software_render:=true mavros:=true qgc:=true
 
 # Record the camera feed and logs to a rosbag
 ros2 launch ./sim.launch.py record:=true bag_name:=object_occlusion_test
+
+# Same tracking settings as the real ZED camera (BoT-SORT, see below)
+ros2 launch ./sim.launch.py tracker:=botsort
 ```
 
-Launch arguments: `px4`, `yolo`, `mavros`, `qgc`, `viewer`, `record`, `software_render` (all `true`/`false`), and `bag_name`.
+Launch arguments: `px4`, `yolo`, `mavros`, `qgc`, `viewer`, `record`, `software_render`, `show_window` (all `true`/`false`), `bag_name`, `stale_timeout` (seconds, default 3.0) and `tracker`:
+
+- `bytetrack` (default): the original settings, ByteTrack on every 3rd frame.
+- `botsort`: the same tracking settings as `zed.launch.py`: BoT-SORT with camera motion
+  compensation, every frame, an ID only after 3 frames in a row. Use it to compare the sim with the
+  real camera.
+
+`setup_zed.sh` also adds a `sim-demo` command: `ros2 launch ./sim.launch.py tracker:=botsort`, plus
+`software_render:=true` when it detects a virtual machine. Options go after it, for example
+`sim-demo record:=true bag_name:=sim_test`.
 
 Ctrl+C stops everything and closes the rosbag cleanly.
 

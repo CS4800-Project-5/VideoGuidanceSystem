@@ -109,5 +109,26 @@ echo "$LINE" >> ~/.bashrc
 echo "Open a new terminal and type:  zed-demo"
 echo "Options go after it, e.g.:     zed-demo flip:=true stale_timeout:=5.0"
 
+step "sim-demo command (Gazebo simulation with the same tracking settings)"
+# sim.launch.py runs ~/yolo_camera_node.py: link it to this repo's node (README, Setup step 4).
+if [ -L "$HOME/yolo_camera_node.py" ] || [ ! -e "$HOME/yolo_camera_node.py" ]; then
+    ln -sf "$HERE/yolo_camera_node.py" "$HOME/yolo_camera_node.py"
+else
+    echo "Note: ~/yolo_camera_node.py is a copy, not a link, so sim-demo runs that copy."
+    echo "To run this repo's node instead: ln -sf $HERE/yolo_camera_node.py ~/yolo_camera_node.py"
+fi
+SIM_ARGS="tracker:=botsort"
+# Gazebo's 3D rendering crashes on a VM's virtual graphics card (README, "Running in a VMware").
+if [ "$(systemd-detect-virt 2>/dev/null || true)" != "none" ]; then
+    SIM_ARGS="$SIM_ARGS software_render:=true"
+fi
+LINE="alias sim-demo='source /opt/ros/humble/setup.bash && ros2 launch $HERE/sim.launch.py $SIM_ARGS'"
+sed -i '/^alias sim-demo=/d' ~/.bashrc
+echo "$LINE" >> ~/.bashrc
+echo "Open a new terminal and type:  sim-demo"
+if [ ! -d "$HOME/PX4-Autopilot" ]; then
+    echo "Note: ~/PX4-Autopilot not found; sim-demo needs PX4 + Gazebo (README, Setup)."
+fi
+
 echo
 echo "Setup done."
