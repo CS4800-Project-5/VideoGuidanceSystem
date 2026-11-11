@@ -197,8 +197,14 @@ Launch arguments: `px4`, `yolo`, `mavros`, `qgc`, `viewer`, `record`, `software_
 
 - `bytetrack` (default): the original settings, ByteTrack on every 3rd frame.
 - `botsort`: the same tracking settings as `zed.launch.py`: BoT-SORT with camera motion
-  compensation, every frame, an ID only after 3 frames in a row. Use it to compare the sim with the
-  real camera.
+  compensation, every frame, an ID only after 3 frames in a row. One difference
+  ([`botsort_sim.yaml`](botsort_sim.yaml)): tracking starts at 25% confidence instead of 40%,
+  because YOLO is less confident about the rendered person and would otherwise never track them.
+
+Every 5 seconds the node logs what each stage sees, for example
+`Status: YOLO sees 1 people, best 37% -> tracker follows 1 -> 1 with an ID, 4.2 fps`. If a visible
+person gets no box, this shows whether YOLO missed them or the tracker filtered them out
+(`status_period:=0` turns it off).
 
 `setup_zed.sh` also adds a `sim-demo` command: `ros2 launch ./sim.launch.py tracker:=botsort`, plus
 `software_render:=true` when it detects a virtual machine. Options go after it, for example
