@@ -86,6 +86,15 @@ class YoloCameraNode(Node):
 
         # OpenCV window; false on the drone, which has no monitor.
         self.show_window = bool(self.declare_parameter("show_window", True).value)
+        # Every this many seconds, log what each stage sees (YOLO -> tracker -> IDs), which shows
+        # where a person gets lost when they are visible but get no box. 0 turns it off.
+        self.status_period = float(self.declare_parameter(
+            "status_period", 5.0, ParameterDescriptor(dynamic_typing=True)).value)
+        self.last_status_wall = time.monotonic()
+        self.detections = (0, 0, 0.0)  # YOLO, last frame: people >= 25%, weaker ones, best confidence
+        # Runs right after YOLO and before the tracker (the tracker adds its own callback on the
+        # first track() call, after this one), so it sees YOLO's raw detections.
+        self.model.add_callback("on_predict_postprocess_end", self.count_detections)
         self.frame_count = 0
 
         # Entry/exit tracking state.
@@ -210,6 +219,9 @@ class YoloCameraNode(Node):
             # (our id, box, confidence, distance in m or None) for each confirmed person
             people = self.confirmed_people(results[0].boxes, depth)
             current_ids = {person[0] for person in people}
+            boxes = results[0].boxes
+            tracked = 0 if boxes is None or boxes.id is None else len(boxes.id)
+            self.log_status(tracked, len(people))
 
             # A newly observed ID means that an object entered the view.
             for track_id in current_ids:
@@ -241,6 +253,25 @@ class YoloCameraNode(Node):
             self.get_logger().error(
                 f"Image processing error: {error}"
             )
+
+    def count_detections(self, predictor):
+        boxes = predictor.results[0].boxes
+        confidences = [] if boxes is None else boxes.conf.cpu().tolist()
+        strong = sum(1 for c in confidences if c >= 0.25)
+        self.detections = (strong, len(confidences) - strong, max(confidences, default=0.0))
+
+    def log_status(self, tracked, with_id):
+        now = time.monotonic()
+        if self.status_period <= 0 or now - self.last_status_wall < self.status_period:
+            return
+        self.last_status_wall = now
+        strong, weak, best = self.detections
+        self.get_logger().info(
+            f"Status: YOLO sees {strong} people"
+            + (f" (+{weak} weak, under 25%)" if weak else "")
+            + (f", best {best * 100:.0f}%" if strong or weak else "")
+            + f" -> tracker follows {tracked} -> {with_id} with an ID, {self.fps:.1f} fps"
+        )
 
     def confirmed_people(self, boxes, depth):
         """The tracker's results with our IDs: only people tracked for min_hits frames in a row."""

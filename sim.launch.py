@@ -46,13 +46,16 @@ def yolo_node(context):
     """The YOLO node, with the tracking settings chosen by the `tracker` argument:
     bytetrack: the original settings (ByteTrack, every 3rd frame, ID on first sight).
     botsort:   the same settings as zed.launch.py (BoT-SORT with camera motion compensation,
-               every frame, weak detections kept for existing tracks, ID after 3 frames).
+               every frame, weak detections kept for existing tracks, ID after 3 frames),
+               except tracking starts at 25% confidence (botsort_sim.yaml).
     """
     tracker = LaunchConfiguration("tracker").perform(context)
     args = ["-p", f"stale_timeout:={LaunchConfiguration('stale_timeout').perform(context)}",
             "-p", f"show_window:={LaunchConfiguration('show_window').perform(context)}"]
     if tracker == "botsort":
-        args += ["-p", f"tracker:={os.path.join(HERE, 'botsort_zed.yaml')}",
+        # botsort_sim.yaml: botsort_zed.yaml, but it starts tracking at 25% confidence instead
+        # of 40%, because YOLO is less confident about the rendered person.
+        args += ["-p", f"tracker:={os.path.join(HERE, 'botsort_sim.yaml')}",
                  "-p", "conf:=0.1",
                  "-p", "min_hits:=3",
                  "-p", "process_every:=1"]
