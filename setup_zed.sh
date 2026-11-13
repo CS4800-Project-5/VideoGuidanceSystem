@@ -70,14 +70,16 @@ fi
 source /opt/ros/humble/setup.bash
 "$VENV/bin/python" -c "import rclpy, cv_bridge, ultralytics, lap, cv2; print('ok')"
 
-step "YOLO model (saved in the repo folder, so no download is needed later)"
+step "YOLO models (saved in the repo folder, so no download is needed later)"
 (cd "$HERE" && "$VENV/bin/python" -c "
 from ultralytics import YOLO
 import numpy as np
-for tracker in ('bytetrack_occlusion.yaml', 'botsort_zed.yaml'):
-    YOLO('yolov8n.pt').track(np.zeros((376, 672, 3), np.uint8), persist=True,
-                              tracker=tracker, verbose=False)
-print('ok: yolov8n.pt and the tracker work')
+# yolov8n.pt: simulation default; yolo11s.pt: zed-demo default.
+for weights in ('yolov8n.pt', 'yolo11s.pt'):
+    for tracker in ('bytetrack_occlusion.yaml', 'botsort_zed.yaml'):
+        YOLO(weights).track(np.zeros((376, 672, 3), np.uint8), persist=True,
+                            tracker=tracker, verbose=False)
+print('ok: yolov8n.pt, yolo11s.pt and the trackers work')
 ")
 
 step "ZED factory calibration"

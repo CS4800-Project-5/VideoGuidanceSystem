@@ -68,6 +68,7 @@ yolo_camera_node.py
 | `scenario.py` | Repeatable Gazebo test scenarios (entry/exit and occlusion) driven by the `gz` CLI. |
 | `zed.launch.py` | The real ZED camera on a laptop: camera + YOLO node, with each person's distance. |
 | `setup_zed.sh` | One-time setup for `zed.launch.py`, and the `zed-demo` command. |
+| `compare_models.py` | Compares YOLO models and input sizes on a recorded rosbag. |
 
 ## Requirements status
 
@@ -266,6 +267,25 @@ about 12 people). The ZED launch therefore uses BoT-SORT with camera motion comp
 partly hidden people stay tracked, and gives a person an ID only after 3 frames in a row
 (`min_hits`), so one-frame false detections don't use up IDs. IDs are numbered in order
 (1, 2, 3, ...); the tracker's own numbers skip every short-lived candidate. Same test: 23 IDs.
+
+**Detecting more people:** the ZED launch uses `yolo11s.pt` instead of the sim's `yolov8n.pt`.
+On a test crowd scene with near and far people (VGA, image size 640) it found 59% of them at 25%+
+confidence instead of 20%, at about twice the CPU time. Options:
+
+| Option | Effect |
+| --- | --- |
+| `model:=yolov8n.pt` | fastest, finds the fewest far-away people |
+| `imgsz:=960` | about 2x slower, finds many more small / far people (80% with yolo11s in the same test) |
+| `resolution:=HD720` | 4x the pixels per frame (try with `imgsz:=1280`); depth takes ~4x the CPU; needs USB 3 |
+
+To choose on real footage and on your own computer, record a bag and compare:
+
+```bash
+zed-demo record:=true bag_name:=class1
+~/yolo_ros2_env/bin/python compare_models.py class1    # after: source /opt/ros/humble/setup.bash
+```
+
+It prints people found per frame, average confidence and time per frame for each model and size.
 
 **Expect** a few frames per second: the CPU computes both the stereo depth and YOLO. Depth has holes
 on plain walls and ceilings.
