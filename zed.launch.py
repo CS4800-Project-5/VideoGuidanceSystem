@@ -12,6 +12,8 @@ Usage (after running ./setup_zed.sh once):
     zed-demo flip:=true                       # camera mounted upside down
     zed-demo stale_timeout:=5.0               # people keep their ID for up to 5 s out of view
     zed-demo record:=true bag_name:=zed_test  # also record a rosbag
+    zed-demo model:=yolov8n.pt                # fastest model (fewer detections)
+    zed-demo imgsz:=960                       # more far-away people, ~2x slower
 
 Ctrl+C stops everything, and rosbag2 closes the bag cleanly.
 """
@@ -73,7 +75,8 @@ def launch_setup(context):
         # ---- ZED camera over USB: color + depth (CPU stereo) ----
         ExecuteProcess(
             cmd=["python3", os.path.join(zed_usb_dir, "zed_usb_publisher.py"), "--ros-args",
-                 "-r", "__node:=zed_node", "-r", "__ns:=/zed", "-p", ["flip:=", flip]],
+                 "-r", "__node:=zed_node", "-r", "__ns:=/zed", "-p", ["flip:=", flip],
+                 "-p", ["resolution:=", LaunchConfiguration("resolution")]],
             # The system OpenCV is built for NumPy 1; a NumPy 2 in ~/.local would break it.
             additional_env={"PYTHONNOUSERSITE": "1"},
             output="screen",
@@ -88,8 +91,9 @@ def launch_setup(context):
                  "-p", "camera_qos:=reliable",
                  # The ZED gives far fewer frames per second than the sim on a CPU: use every one.
                  "-p", "process_every:=1",
-                 # 672x376 images: 640 keeps people small in the image (far away) detectable.
-                 "-p", "imgsz:=640",
+                 # Detection: model and input size (see the launch arguments).
+                 "-p", ["model:=", LaunchConfiguration("model")],
+                 "-p", ["imgsz:=", LaunchConfiguration("imgsz")],
                  # Handheld camera: BoT-SORT compensates for the camera's own motion; weak
                  # detections keep partly hidden people tracked; an ID only after 3 frames in a row.
                  "-p", f"tracker:={os.path.join(HERE, 'botsort_zed.yaml')}",
@@ -120,6 +124,16 @@ def generate_launch_description():
                               description="'true' if the camera is mounted upside down"),
         DeclareLaunchArgument("stale_timeout", default_value="3.0",
                               description="Seconds a person can be out of view and keep their ID"),
+        DeclareLaunchArgument("model", default_value="yolo11s.pt",
+                              description="YOLO weights. yolo11s.pt finds far more small/far people "
+                                          "than yolov8n.pt (the fastest) at about 2x the CPU time; "
+                                          "yolov8m.pt is better still and ~5x slower"),
+        DeclareLaunchArgument("imgsz", default_value="640",
+                              description="YOLO input size. 960 finds more far-away people but takes "
+                                          "about 2x as long; for resolution:=HD720 try 1280"),
+        DeclareLaunchArgument("resolution", default_value="VGA",
+                              description="ZED resolution: VGA (672x376) or HD720 (1280x720, more "
+                                          "detail for far people, but depth takes ~4x the CPU; needs USB 3)"),
         DeclareLaunchArgument("min_hits", default_value="3",
                               description="Frames in a row a person must be tracked before getting an ID"),
         DeclareLaunchArgument("show_window", default_value="true",

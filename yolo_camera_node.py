@@ -50,7 +50,10 @@ class YoloCameraNode(Node):
         super().__init__("yolo_camera_node")
 
         self.bridge = CvBridge()
-        self.model = YOLO("yolov8n.pt")
+        # YOLO weights: yolov8n.pt (smallest, fastest) by default. zed.launch.py uses yolo11s.pt,
+        # which finds far more small / far-away people at about twice the CPU time. A file name
+        # is looked up in the working directory (the repo folder) and downloaded there if missing.
+        self.model = YOLO(self.declare_parameter("model", "yolov8n.pt").value)
 
         # ---- Camera input ----
         self.camera_topic = self.declare_parameter("camera_topic", CAMERA_TOPIC).value
