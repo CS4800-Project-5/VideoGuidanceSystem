@@ -14,6 +14,8 @@ Usage (after running ./setup_zed.sh once):
     zed-demo record:=true bag_name:=zed_test  # also record a rosbag
     zed-demo model:=yolov8n.pt                # fastest model (fewer detections)
     zed-demo imgsz:=960                       # more far-away people, ~2x slower
+    zed-demo reid_threshold:=0.6              # re-identify returning people more readily
+    zed-demo reid:=false                      # no re-identification (IDs only last stale_timeout)
 
 Ctrl+C stops everything, and rosbag2 closes the bag cleanly.
 """
@@ -99,6 +101,9 @@ def launch_setup(context):
                  "-p", f"tracker:={os.path.join(HERE, 'botsort_zed.yaml')}",
                  "-p", "conf:=0.1",
                  "-p", ["min_hits:=", LaunchConfiguration("min_hits")],
+                 # Re-identification: recognize returning people by appearance, no time limit.
+                 "-p", ["reid:=", LaunchConfiguration("reid")],
+                 "-p", ["reid_threshold:=", LaunchConfiguration("reid_threshold")],
                  "-p", ["stale_timeout:=", stale_timeout],
                  "-p", ["show_window:=", show_window]],
             # yolov8n.pt is loaded from the repo folder (setup_zed.sh downloads it there), so no
@@ -134,6 +139,12 @@ def generate_launch_description():
         DeclareLaunchArgument("resolution", default_value="VGA",
                               description="ZED resolution: VGA (672x376) or HD720 (1280x720, more "
                                           "detail for far people, but depth takes ~4x the CPU; needs USB 3)"),
+        DeclareLaunchArgument("reid", default_value="true",
+                              description="Recognize people who come back (left the view, or the camera "
+                                          "left the room) by appearance, and give them their old ID"),
+        DeclareLaunchArgument("reid_threshold", default_value="-1",
+                              description="Appearance similarity needed to count as the same person; "
+                                          "-1 = the model's default (OSNet 0.65)"),
         DeclareLaunchArgument("min_hits", default_value="3",
                               description="Frames in a row a person must be tracked before getting an ID"),
         DeclareLaunchArgument("show_window", default_value="true",

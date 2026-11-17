@@ -69,6 +69,8 @@ yolo_camera_node.py
 | `zed.launch.py` | The real ZED camera on a laptop: camera + YOLO node, with each person's distance. |
 | `setup_zed.sh` | One-time setup for `zed.launch.py`, and the `zed-demo` command. |
 | `compare_models.py` | Compares YOLO models and input sizes on a recorded rosbag. |
+| `reidentifier.py` | Re-identification: recognizes returning people by appearance, with no time limit. |
+| `osnet.py` | OSNet person re-identification network, from [torchreid](https://github.com/KaiyangZhou/deep-person-reid) (MIT). |
 
 ## Requirements status
 
@@ -267,6 +269,48 @@ about 12 people). The ZED launch therefore uses BoT-SORT with camera motion comp
 partly hidden people stay tracked, and gives a person an ID only after 3 frames in a row
 (`min_hits`), so one-frame false detections don't use up IDs. IDs are numbered in order
 (1, 2, 3, ...); the tracker's own numbers skip every short-lived candidate. Same test: 23 IDs.
+
+**Recognizing people who come back (re-identification):** the tracker alone remembers someone
+only for `stale_timeout` seconds. With re-identification (on in `zed-demo` and `sim-demo`), the node
+also remembers what every person looks like, with no time limit, so a person who leaves the view,
+or the whole camera leaving the room and coming back, gets their old ID again:
+
+```
+Object left camera view: ID 3 (unseen for 3.2s)
+...
+Object entered camera view: ID 3 (re-identified by appearance, similarity 0.81)
+Object entered camera view: ID 7 (new person; most similar remembered: ID 2 at 0.48, needs 0.65)
+```
+
+How it works ([`reidentifier.py`](reidentifier.py), based on Angel's re-ID in `angel-branch`):
+
+1. While a new track is being confirmed (`min_hits` frames), each crop of the person goes through
+   **OSNet**, a small network trained to recognize the same person across cameras and angles
+   (`osnet_x0_5`, trained on MSMT17). Each crop becomes a 512-number appearance "fingerprint".
+2. When the track is confirmed, the average fingerprint is compared with every remembered person
+   who is **not in view right now** (so two people in view never share an ID). The best match
+   above `reid_threshold`, clearly better than the second best, gets that person's ID back;
+   otherwise the person gets a new ID.
+3. Every 5 frames, a new sample of each person in clear view (confident, not overlapping anyone)
+   is added to their memory (up to 12 varied samples per person), so they are recognized from
+   different angles.
+
+`setup_zed.sh` downloads the OSNet weights (`osnet_x0_5_msmt17.pth`, from torchreid's model zoo
+on Google Drive). Without them, re-identification falls back to clothing colors (Angel's color
+histogram), which mixes up people in similar clothes. Options:
+
+| Option | Effect |
+| --- | --- |
+| `reid_threshold:=0.6` | similarity needed to count as the same person (default 0.65 with OSNet). Lower if returning people get new IDs; raise if two people get mixed up. The log lines show the scores |
+| `reid:=false` | turn re-identification off |
+
+It recognizes people by their whole appearance (mostly clothes and build), not faces, so someone
+who changes clothes gets a new ID, and people dressed alike can be confused. The memory is kept
+only while the program runs; nothing is saved to disk.
+
+Tested on photos (stand-in for the camera, with the clothing-color fallback, since the OSNet weights
+can't be downloaded in that test environment): people hidden for 10 s and a camera "leaving the
+room" for 20 s kept their IDs, and different people got new IDs. Re-ID added about 14% CPU time.
 
 **Detecting more people:** the ZED launch uses `yolo11s.pt` instead of the sim's `yolov8n.pt`.
 On a test crowd scene with near and far people (VGA, image size 640) it found 59% of them at 25%+

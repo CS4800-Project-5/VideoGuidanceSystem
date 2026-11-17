@@ -13,6 +13,8 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_
 from sensor_msgs.msg import Image
 from ultralytics import YOLO
 
+from reidentifier import ReIdentifier, make_extractor, mean_feature
+
 
 # Default camera: the Gazebo simulation. zed.launch.py sets camera_topic and depth_topic
 # to the ZED's topics instead (same names as the ZED ROS 2 wrapper on the Jetson).
@@ -21,11 +23,23 @@ CAMERA_TOPIC = (
     "link/camera_link/sensor/camera/image"
 )
 
+HERE = os.path.dirname(os.path.realpath(__file__))
+
 # The tracker config sits next to this file in the repo, so the path works on any machine.
-TRACKER_CONFIG = os.path.join(
-    os.path.dirname(os.path.realpath(__file__)),
-    "bytetrack_occlusion.yaml",
-)
+TRACKER_CONFIG = os.path.join(HERE, "bytetrack_occlusion.yaml")
+
+
+def box_overlap(box, others):
+    """Largest IoU between a box and a list of other boxes (0 if none)."""
+    best = 0.0
+    x1, y1, x2, y2 = box
+    for ox1, oy1, ox2, oy2 in others:
+        iw, ih = min(x2, ox2) - max(x1, ox1), min(y2, oy2) - max(y1, oy1)
+        if iw <= 0 or ih <= 0:
+            continue
+        inter = iw * ih
+        best = max(best, inter / ((x2 - x1) * (y2 - y1) + (ox2 - ox1) * (oy2 - oy1) - inter))
+    return best
 
 
 def person_distance(depth, box):
@@ -86,6 +100,33 @@ class YoloCameraNode(Node):
         self.display_ids = {}          # tracker id -> our id
         self.hits = {}                 # tracker id -> processed frames tracked so far
         self.next_display_id = 1
+
+        # ---- Re-identification (reidentifier.py) ----
+        # Remember what each person looks like, with no time limit, so someone who leaves the view
+        # (or the camera leaving the room) gets their old ID back when they are seen again.
+        # Off by default; zed.launch.py and sim-demo turn it on.
+        self.reid = None
+        if bool(self.declare_parameter("reid", False).value):
+            extractor = make_extractor(
+                self.declare_parameter("reid_model", os.path.join(HERE, "osnet_x0_5_msmt17.pth")).value,
+                self.get_logger(),
+            )
+            self.reid = ReIdentifier(
+                extractor,
+                # Similarity needed to count as the same person; -1 = the model's default
+                # (OSNet 0.65, clothing colors 0.7). Lower = fewer new IDs for returning people,
+                # but more risk of mixing up two people.
+                threshold=float(self.declare_parameter(
+                    "reid_threshold", -1.0, ParameterDescriptor(dynamic_typing=True)).value),
+                # Seconds to remember someone who is gone; 0 = for as long as the program runs.
+                memory_seconds=float(self.declare_parameter(
+                    "reid_memory", 0.0, ParameterDescriptor(dynamic_typing=True)).value),
+            )
+            # Add a new appearance sample of each person every this many processed frames.
+            self.reid_every = max(1, int(self.declare_parameter("reid_every", 5).value))
+        self.track_features = {}       # tracker id -> appearance samples while being confirmed
+        self.since_sample = {}         # tracker id -> processed frames since its last sample
+        self.reid_events = {}          # our id -> (how, similarity, closest id), this frame
 
         # OpenCV window; false on the drone, which has no monitor.
         self.show_window = bool(self.declare_parameter("show_window", True).value)
@@ -220,7 +261,7 @@ class YoloCameraNode(Node):
             self.set_track_buffer(stamp)
 
             # (our id, box, confidence, distance in m or None) for each confirmed person
-            people = self.confirmed_people(results[0].boxes, depth)
+            people = self.confirmed_people(results[0].boxes, depth, frame, stamp)
             current_ids = {person[0] for person in people}
             boxes = results[0].boxes
             tracked = 0 if boxes is None or boxes.id is None else len(boxes.id)
@@ -230,7 +271,7 @@ class YoloCameraNode(Node):
             for track_id in current_ids:
                 if track_id not in self.last_seen:
                     self.get_logger().info(
-                        f"Object entered camera view: ID {track_id}"
+                        f"Object entered camera view: ID {track_id}{self.reid_note(track_id)}"
                     )
 
                 self.last_seen[track_id] = stamp
@@ -257,6 +298,18 @@ class YoloCameraNode(Node):
                 f"Image processing error: {error}"
             )
 
+    def reid_note(self, display_id):
+        """How re-identification decided an ID, for the entered log line."""
+        if self.reid is None or display_id not in self.reid_events:
+            return ""
+        how, score, closest = self.reid_events[display_id]
+        if how == "reidentified":
+            return f" (re-identified by appearance, similarity {score:.2f})"
+        if closest is None:
+            return " (new person)"
+        return (f" (new person; most similar remembered: ID {closest} at {score:.2f}, "
+                f"needs {self.reid.threshold:.2f})")
+
     def count_detections(self, predictor):
         boxes = predictor.results[0].boxes
         confidences = [] if boxes is None else boxes.conf.cpu().tolist()
@@ -274,36 +327,115 @@ class YoloCameraNode(Node):
             + (f" (+{weak} weak, under 25%)" if weak else "")
             + (f", best {best * 100:.0f}%" if strong or weak else "")
             + f" -> tracker follows {tracked} -> {with_id} with an ID, {self.fps:.1f} fps"
+            + (f", remembering {len(self.reid)} people" if self.reid is not None else "")
         )
 
-    def confirmed_people(self, boxes, depth):
-        """The tracker's results with our IDs: only people tracked for min_hits frames in a row."""
+    def confirmed_people(self, boxes, depth, frame, stamp):
+        """The tracker's results with our IDs: only people tracked for min_hits frames in a row.
+
+        With re-identification, a newly confirmed track is first compared with every remembered
+        person who is not in view right now, and gets their ID if the appearance matches.
+        """
+        self.reid_events = {}
+        rows = []
+        if boxes is not None and boxes.id is not None:
+            rows = list(zip(boxes.id.int().cpu().tolist(), boxes.xyxy.cpu().tolist(),
+                            boxes.conf.cpu().tolist()))
+
+        # 1. Which tracks already have an ID, and which reach min_hits now.
+        visible, confirming = set(), []
+        for tracker_id, _, _ in rows:
+            self.hits[tracker_id] = self.hits.get(tracker_id, 0) + 1
+            if tracker_id in self.display_ids:
+                visible.add(self.display_ids[tracker_id])
+            elif self.hits[tracker_id] >= self.min_hits:
+                confirming.append(tracker_id)
+
+        # 2. Appearance samples, in one batch: tracks not confirmed yet (for matching), and
+        #    confirmed people due for a new sample when the view of them is clear.
+        if self.reid is not None and rows:
+            self.sample_appearance(rows, frame, stamp)
+
+        # 3. Give newly confirmed tracks an ID: a remembered person's, or a new one.
+        if confirming:
+            matches = {}
+            if self.reid is not None:
+                queries = {t: mean_feature(self.track_features.get(t, [])) for t in confirming}
+                matches = self.reid.match(queries, exclude=visible)
+            for tracker_id in confirming:
+                person_id, score, closest = matches.get(tracker_id, (None, None, None))
+                if person_id is None:
+                    person_id, how = self.next_display_id, "new"
+                    self.next_display_id += 1
+                else:
+                    how = "reidentified"
+                    # Their old track (lost earlier) no longer stands for them.
+                    for t in [t for t, d in self.display_ids.items() if d == person_id]:
+                        del self.display_ids[t]
+                self.display_ids[tracker_id] = person_id
+                visible.add(person_id)
+                self.reid_events[person_id] = (how, score, closest)
+                if self.reid is not None:
+                    for feature in self.track_features.pop(tracker_id, []):
+                        self.reid.add(person_id, feature, stamp)
+
+        # 4. The confirmed people in this frame.
         people = []
         seen = set()
-        if boxes is not None and boxes.id is not None:
-            for tracker_id, box, confidence in zip(
-                boxes.id.int().cpu().tolist(), boxes.xyxy.cpu().tolist(), boxes.conf.cpu().tolist()
-            ):
-                seen.add(tracker_id)
-                self.hits[tracker_id] = self.hits.get(tracker_id, 0) + 1
-                if tracker_id not in self.display_ids:
-                    if self.hits[tracker_id] < self.min_hits:
-                        continue
-                    self.display_ids[tracker_id] = self.next_display_id
-                    self.next_display_id += 1
-                meters = person_distance(depth, box) if depth is not None else None
-                people.append((self.display_ids[tracker_id], box, confidence, meters))
+        for tracker_id, box, confidence in rows:
+            seen.add(tracker_id)
+            if tracker_id not in self.display_ids:
+                continue
+            person_id = self.display_ids[tracker_id]
+            if self.reid is not None:
+                self.reid.seen(person_id, stamp)
+            meters = person_distance(depth, box) if depth is not None else None
+            people.append((person_id, box, confidence, meters))
+
         # Candidates must be seen in consecutive frames to count.
         for tracker_id in list(self.hits):
             if tracker_id not in seen and tracker_id not in self.display_ids:
                 del self.hits[tracker_id]
+                self.track_features.pop(tracker_id, None)
+        if self.reid is not None:
+            self.reid.expire(stamp)
         return people
+
+    def sample_appearance(self, rows, frame, stamp):
+        img_h, img_w = frame.shape[:2]
+        wanted, crops = [], []
+        for i, (tracker_id, box, confidence) in enumerate(rows):
+            others = [b for j, (_, b, _) in enumerate(rows) if j != i]
+            if tracker_id in self.display_ids:
+                self.since_sample[tracker_id] = self.since_sample.get(tracker_id, self.reid_every) + 1
+                # A clear view only: confident, and not overlapping someone else (whose clothes
+                # would end up in this person's sample).
+                if (self.since_sample[tracker_id] < self.reid_every or confidence < 0.5
+                        or box_overlap(box, others) > 0.2):
+                    continue
+                self.since_sample[tracker_id] = 0
+            elif box_overlap(box, others) > 0.5:
+                continue
+            x1, y1, x2, y2 = (int(round(v)) for v in box)
+            crop = frame[max(0, y1):min(img_h, y2), max(0, x1):min(img_w, x2)]
+            if crop.size:
+                wanted.append(tracker_id)
+                crops.append(crop)
+        for tracker_id, feature in zip(wanted, self.reid.extractor.extract_batch(crops)):
+            if tracker_id in self.display_ids:
+                self.reid.add(self.display_ids[tracker_id], feature, stamp)
+            elif feature is not None:
+                samples = self.track_features.setdefault(tracker_id, [])
+                samples.append(feature)
+                del samples[:-5]   # the last 5 samples are enough
 
     def forget(self, display_id):
         """Drop the tracker ids behind one of our ids once it has gone stale."""
         for tracker_id in [t for t, d in self.display_ids.items() if d == display_id]:
             del self.display_ids[tracker_id]
             self.hits.pop(tracker_id, None)
+            self.since_sample.pop(tracker_id, None)
+        # With re-identification, their appearance stays remembered (reidentifier.py).
 
     @staticmethod
     def draw(frame, people, with_depth):
@@ -375,6 +507,10 @@ class YoloCameraNode(Node):
         self.display_ids.clear()
         self.hits.clear()
         self.next_display_id = 1
+        self.track_features.clear()
+        self.since_sample.clear()
+        if self.reid is not None:
+            self.reid.reset()
 
 
 def main(args=None):

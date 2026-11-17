@@ -82,6 +82,30 @@ for weights in ('yolov8n.pt', 'yolo11s.pt'):
 print('ok: yolov8n.pt, yolo11s.pt and the trackers work')
 ")
 
+step "Person re-identification model (OSNet, from torchreid's model zoo on Google Drive)"
+# osnet_x0_5 trained on MSMT17 (all splits, for use in new places), from
+# https://github.com/KaiyangZhou/deep-person-reid/blob/master/docs/MODEL_ZOO.md
+REID_WEIGHTS="$HERE/osnet_x0_5_msmt17.pth"
+REID_DRIVE_ID="1DHgmb6XV4fwG3n-CnCM0zdL9nMsZ9_RF"
+if [ ! -s "$REID_WEIGHTS" ]; then
+    "$VENV/bin/pip" install -q gdown
+    "$VENV/bin/gdown" --quiet "https://drive.google.com/uc?id=$REID_DRIVE_ID" -O "$REID_WEIGHTS" \
+        || rm -f "$REID_WEIGHTS"
+fi
+if (cd "$HERE" && "$VENV/bin/python" -c "
+from reidentifier import OSNetExtractor
+import numpy as np
+f = OSNetExtractor('$REID_WEIGHTS').extract(np.zeros((256, 128, 3), np.uint8))
+assert f is not None and f.shape == (512,)
+print('ok: OSNet re-identification model works')
+"); then :
+else
+    echo "Could not download or load the OSNet weights. Re-identification will use clothing colors"
+    echo "instead (less accurate). To fix: download the osnet_x0_5 MSMT17 'combineall' model from"
+    echo "  https://drive.google.com/file/d/$REID_DRIVE_ID/view"
+    echo "save it as $REID_WEIGHTS, and run this script again."
+fi
+
 step "ZED factory calibration"
 if PYTHONNOUSERSITE=1 python3 - "$PROJ1/zed_usb" <<'EOF'
 import os, sys

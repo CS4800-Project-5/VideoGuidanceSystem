@@ -47,7 +47,8 @@ def yolo_node(context):
     bytetrack: the original settings (ByteTrack, every 3rd frame, ID on first sight).
     botsort:   the same settings as zed.launch.py (BoT-SORT with camera motion compensation,
                every frame, weak detections kept for existing tracks, ID after 3 frames),
-               except tracking starts at 25% confidence (botsort_sim.yaml).
+               except tracking starts at 25% confidence (botsort_sim.yaml). Re-identification is
+               on unless reid:=false.
     """
     tracker = LaunchConfiguration("tracker").perform(context)
     args = ["-p", f"stale_timeout:={LaunchConfiguration('stale_timeout').perform(context)}",
@@ -58,7 +59,8 @@ def yolo_node(context):
         args += ["-p", f"tracker:={os.path.join(HERE, 'botsort_sim.yaml')}",
                  "-p", "conf:=0.1",
                  "-p", "min_hits:=3",
-                 "-p", "process_every:=1"]
+                 "-p", "process_every:=1",
+                 "-p", f"reid:={LaunchConfiguration('reid').perform(context)}"]
     elif tracker != "bytetrack":
         raise ValueError(f"tracker must be 'bytetrack' or 'botsort', not '{tracker}'")
     return [ExecuteProcess(
@@ -95,6 +97,9 @@ def generate_launch_description():
         DeclareLaunchArgument("tracker", default_value="bytetrack",
                               description="'bytetrack' (original settings) or 'botsort' "
                                           "(same tracking settings as zed.launch.py)"),
+        DeclareLaunchArgument("reid", default_value="true",
+                              description="With tracker:=botsort: recognize returning objects by "
+                                          "appearance (reidentifier.py)"),
         DeclareLaunchArgument("stale_timeout", default_value="3.0",
                               description="Seconds an object can be out of view and keep its ID"),
         DeclareLaunchArgument("show_window", default_value="true",
