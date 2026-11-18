@@ -68,7 +68,7 @@ if [ ! -x "$VENV/bin/python" ]; then
 fi
 # lap: needed by the BoT-SORT tracker. Ultralytics would otherwise try to download it the first time the
 # node runs, which fails without internet (e.g. in class).
-"$VENV/bin/pip" install -q "lap>=0.5.12" "numpy<2" pytest
+"$VENV/bin/pip" install -q "lap>=0.5.12" "numpy<2"
 source /opt/ros/humble/setup.bash
 "$VENV/bin/python" -c "import rclpy, cv_bridge, ultralytics, lap, cv2, vision_msgs.msg, tf2_ros; print('ok')"
 
