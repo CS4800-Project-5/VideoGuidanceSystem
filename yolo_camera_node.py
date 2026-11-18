@@ -83,6 +83,22 @@ class YoloCameraNode(Node):
         # "cpu" in the sim and on a laptop; "cuda" (or "0") on the Jetson.
         self.device = self.declare_parameter("device", "cpu").value
 
+        # Classes to detect and track, by YOLO's (COCO) names, e.g. ["person", "car", "truck",
+        # "bicycle", "dog"]. On the command line: -p classes:="[person, car]". Re-identification
+        # by appearance applies to people only (OSNet is trained on people); other objects keep
+        # their ID through the tracker alone.
+        self.class_names = dict(self.model.names)                 # id -> name
+        ids_by_name = {name: i for i, name in self.class_names.items()}
+        wanted = [str(c).strip() for c in self.declare_parameter("classes", ["person"]).value]
+        unknown = [c for c in wanted if c not in ids_by_name]
+        if unknown:
+            self.get_logger().error(f"Unknown classes {unknown}, ignored. The model knows: "
+                                    + ", ".join(self.class_names.values()))
+        self.class_ids = [ids_by_name[c] for c in wanted if c in ids_by_name] or [0]
+        self.person_class = ids_by_name.get("person", 0)
+        self.only_people = self.class_ids == [self.person_class]
+        self.get_logger().info("Detecting: " + ", ".join(self.class_names[i] for i in self.class_ids))
+
         # ---- Camera input ----
         self.camera_topic = self.declare_parameter("camera_topic", CAMERA_TOPIC).value
         # Depth image in meters that lines up pixel for pixel with the camera image (the ZED's
@@ -225,6 +241,7 @@ class YoloCameraNode(Node):
             ).value
         )
         self.last_seen = {}            # track_id -> last image time it was seen (seconds)
+        self.id_classes = {}           # our id -> class name
         self.last_stamp = None         # time of the most recent image (seconds)
         self.last_frame_wall = None    # wall clock time the most recent image arrived
 
@@ -376,14 +393,14 @@ class YoloCameraNode(Node):
                 persist=True,
                 imgsz=self.imgsz,
                 conf=self.conf,
-                classes=[0],
+                classes=self.class_ids,
                 device=self.device,
                 verbose=False,
             )
             self.set_track_buffer(stamp)
 
-            # (our id, box, confidence, distance in m, camera-frame position, size), the last
-            # three None when unknown, for each confirmed person
+            # (our id, box, confidence, distance in m, camera-frame position, size, class name),
+            # position and size None when unknown, for each confirmed object
             people = self.confirmed_people(results[0].boxes, depth, frame, stamp, message.header)
             current_ids = {person[0] for person in people}
             boxes = results[0].boxes
@@ -393,14 +410,15 @@ class YoloCameraNode(Node):
             # Publish every person (with a 3D position when depth and intrinsics are known),
             # and log them to the CSV file.
             with_3d = depth is not None and self.camera_info is not None
-            published = [(person_id, box, confidence, position, size)
-                         for person_id, box, confidence, _, position, size in people]
+            published = [(person_id, box, confidence, position, size, name)
+                         for person_id, box, confidence, _, position, size, name in people]
             self.publisher.publish_frame(message.header, published, with_3d)
             processing_ms = (time.perf_counter() - started) * 1000
             if self.csv is not None:
                 uav_pose = self.uav.current_pose() if self.uav is not None else None
-                for person_id, box, confidence, position, _ in published:
-                    self.csv.log_detection(self.frame_count, person_id, 0, "person", confidence,
+                for person_id, box, confidence, position, _, name in published:
+                    class_id = next((i for i, n in self.class_names.items() if n == name), "")
+                    self.csv.log_detection(self.frame_count, person_id, class_id, name, confidence,
                                            box, processing_ms, stamp=stamp, position=position,
                                            uav_pose=uav_pose)
                 if not published:
@@ -408,10 +426,14 @@ class YoloCameraNode(Node):
                                                           stamp=stamp, uav_pose=uav_pose)
 
             # A newly observed ID means that an object entered the view.
+            names = {person[0]: person[6] for person in people}
             for track_id in current_ids:
                 if track_id not in self.last_seen:
+                    self.id_classes[track_id] = names[track_id]
                     self.get_logger().info(
-                        f"Object entered camera view: ID {track_id}{self.reid_note(track_id)}"
+                        f"Object entered camera view: ID {track_id}"
+                        + ("" if self.only_people else f" ({names[track_id]})")
+                        + self.reid_note(track_id)
                     )
                     self.track_event("entered", track_id, stamp, processing_ms)
 
@@ -447,6 +469,7 @@ class YoloCameraNode(Node):
             how = score = None
         self.publisher.publish_event(
             event, display_id, stamp, reason=reason, how=how,
+            object_class=self.id_classes.get(display_id),
             similarity=None if score is None or how != "reidentified" else round(score, 3))
         if self.csv is not None:
             detail = reason or how or ""
@@ -457,7 +480,8 @@ class YoloCameraNode(Node):
 
     def reid_note(self, display_id):
         """How re-identification decided an ID, for the entered log line."""
-        if self.reid is None or display_id not in self.reid_events:
+        if (self.reid is None or display_id not in self.reid_events
+                or self.id_classes.get(display_id, "person") != "person"):
             return ""
         how, score, closest = self.reid_events[display_id]
         if how == "reidentified":
@@ -480,7 +504,7 @@ class YoloCameraNode(Node):
         self.last_status_wall = now
         strong, weak, best = self.detections
         self.get_logger().info(
-            f"Status: YOLO sees {strong} people"
+            f"Status: YOLO sees {strong} {'people' if self.only_people else 'objects'}"
             + (f" (+{weak} weak, under 25%)" if weak else "")
             + (f", best {best * 100:.0f}%" if strong or weak else "")
             + f" -> tracker follows {tracked} -> {with_id} with an ID, {self.fps:.1f} fps"
@@ -489,27 +513,31 @@ class YoloCameraNode(Node):
         )
 
     def confirmed_people(self, boxes, depth, frame, stamp, header):
-        """The tracker's results with our IDs: only people tracked for min_hits frames in a row.
+        """The tracker's results with our IDs: only objects tracked for min_hits frames in a row.
 
-        With re-identification, a newly confirmed track is first compared with every remembered
-        person who is not in view right now, and gets their ID if the appearance matches.
+        With re-identification, a newly confirmed person is first compared with every remembered
+        person who is not in view right now, and gets their ID if the appearance matches. Other
+        classes get a new ID.
         """
         self.reid_events = {}
         rows = []
         if boxes is not None and boxes.id is not None:
+            classes = (boxes.cls.int().cpu().tolist() if getattr(boxes, "cls", None) is not None
+                       else [self.person_class] * len(boxes.id))
             rows = list(zip(boxes.id.int().cpu().tolist(), boxes.xyxy.cpu().tolist(),
-                            boxes.conf.cpu().tolist()))
+                            boxes.conf.cpu().tolist(), classes))
+        people_rows = [r for r in rows if r[3] == self.person_class]
 
-        # Where each tracked person is: distance, camera-frame position and size, world position.
+        # Where each tracked object is: distance, camera-frame position and size, world position.
         where = {}
-        for tracker_id, box, _ in rows:
+        for tracker_id, box, _, _ in rows:
             meters = person_distance(depth, box) if depth is not None else None
             position, size = self.camera_point(box, meters, frame.shape[1])
             where[tracker_id] = (meters, position, size, self.to_world(header, position))
 
         # 1. Which tracks already have an ID, and which reach min_hits now.
         visible, confirming = set(), []
-        for tracker_id, _, _ in rows:
+        for tracker_id, _, _, _ in rows:
             self.hits[tracker_id] = self.hits.get(tracker_id, 0) + 1
             if tracker_id in self.display_ids:
                 visible.add(self.display_ids[tracker_id])
@@ -518,14 +546,16 @@ class YoloCameraNode(Node):
 
         # 2. Appearance samples, in one batch: tracks not confirmed yet (for matching), and
         #    confirmed people due for a new sample when the view of them is clear.
-        if self.reid is not None and rows:
-            self.sample_appearance(rows, frame, stamp)
+        if self.reid is not None and people_rows:
+            self.sample_appearance(people_rows, rows, frame, stamp)
 
         # 3. Give newly confirmed tracks an ID: a remembered person's, or a new one.
         if confirming:
             matches = {}
+            person_tracks = {r[0] for r in people_rows}
             if self.reid is not None:
-                queries = {t: mean_feature(self.track_features.get(t, [])) for t in confirming}
+                queries = {t: mean_feature(self.track_features.get(t, []))
+                           for t in confirming if t in person_tracks}
                 matches = self.reid.match(queries, exclude=visible,
                                           positions={t: where[t][3] for t in confirming},
                                           stamp=stamp)
@@ -542,22 +572,23 @@ class YoloCameraNode(Node):
                 self.display_ids[tracker_id] = person_id
                 visible.add(person_id)
                 self.reid_events[person_id] = (how, score, closest)
-                if self.reid is not None:
+                if self.reid is not None and tracker_id in person_tracks:
                     for feature in self.track_features.pop(tracker_id, []):
                         self.reid.add(person_id, feature, stamp)
 
         # 4. The confirmed people in this frame.
         people = []
         seen = set()
-        for tracker_id, box, confidence in rows:
+        for tracker_id, box, confidence, class_id in rows:
             seen.add(tracker_id)
             if tracker_id not in self.display_ids:
                 continue
             person_id = self.display_ids[tracker_id]
             meters, position, size, world = where[tracker_id]
-            if self.reid is not None:
+            if self.reid is not None and class_id == self.person_class:
                 self.reid.seen(person_id, stamp, world)
-            people.append((person_id, box, confidence, meters, position, size))
+            people.append((person_id, box, confidence, meters, position, size,
+                           self.class_names.get(class_id, str(class_id))))
 
         # Candidates must be seen in consecutive frames to count.
         for tracker_id in list(self.hits):
@@ -568,11 +599,13 @@ class YoloCameraNode(Node):
             self.reid.expire(stamp)
         return people
 
-    def sample_appearance(self, rows, frame, stamp):
+    def sample_appearance(self, people_rows, all_rows, frame, stamp):
+        """Appearance samples of people (people_rows); a person overlapping any other object
+        (all_rows) is skipped, so the other object doesn't end up in their sample."""
         img_h, img_w = frame.shape[:2]
         wanted, crops = [], []
-        for i, (tracker_id, box, confidence) in enumerate(rows):
-            others = [b for j, (_, b, _) in enumerate(rows) if j != i]
+        for tracker_id, box, confidence, _ in people_rows:
+            others = [b for t, b, _, _ in all_rows if t != tracker_id]
             if tracker_id in self.display_ids:
                 self.since_sample[tracker_id] = self.since_sample.get(tracker_id, self.reid_every) + 1
                 # A clear view only: confident, and not overlapping someone else (whose clothes
@@ -606,13 +639,14 @@ class YoloCameraNode(Node):
 
     @staticmethod
     def draw(frame, people, with_depth):
-        """Boxes with our IDs (one color per ID), confidence and, with depth, the distance."""
+        """Boxes with our IDs (one color per ID), class, confidence and, with depth, the
+        distance."""
         image = frame.copy()
-        for display_id, (x1, y1, x2, y2), confidence, meters, *_ in people:
+        for display_id, (x1, y1, x2, y2), confidence, meters, _, _, name in people:
             hue = (display_id * 47) % 180
             color = tuple(int(c) for c in cv2.cvtColor(
                 np.uint8([[[hue, 220, 230]]]), cv2.COLOR_HSV2BGR)[0, 0])
-            label = f"ID {display_id}  {confidence * 100:.0f}%"
+            label = f"ID {display_id} {name}  {confidence * 100:.0f}%"
             if with_depth:
                 label += f"  {meters:.1f} m" if meters is not None else "  ? m"
             x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
@@ -623,7 +657,7 @@ class YoloCameraNode(Node):
             cv2.rectangle(image, (tx, ty - height - 4), (tx + width + 4, ty), color, -1)
             cv2.putText(image, label, (tx + 2, ty - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0, 0, 0), 1, cv2.LINE_AA)
-        cv2.putText(image, f"{len(people)} people", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+        cv2.putText(image, f"{len(people)} tracked", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (255, 255, 255), 2, cv2.LINE_AA)
         return image
 

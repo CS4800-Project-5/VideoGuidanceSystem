@@ -51,6 +51,7 @@ def yolo_node(context):
             "-p", f"show_window:={LaunchConfiguration('show_window').perform(context)}",
             "-p", f"tracker:={os.path.join(HERE, 'botsort_sim.yaml')}",
             "-p", f"reid:={LaunchConfiguration('reid').perform(context)}",
+            "-p", f"classes:={LaunchConfiguration('classes').perform(context)}",
             # With MAVROS: read the drone's pose and state, and publish the pose to TF
             # (map -> base_link); nothing else publishes TF in the simulation.
             "-p", f"uav:={LaunchConfiguration('mavros').perform(context)}",
@@ -86,6 +87,9 @@ def generate_launch_description():
                               description="Start QGroundControl"),
         DeclareLaunchArgument("yolo", default_value="true",
                               description="Start the YOLO + BoT-SORT node"),
+        DeclareLaunchArgument("classes", default_value="[person]",
+                              description="Classes to detect and track (YOLO's COCO names), "
+                                          "e.g. \"[person, car]\""),
         DeclareLaunchArgument("reid", default_value="true",
                               description="Recognize returning people by appearance "
                                           "(reidentifier.py)"),

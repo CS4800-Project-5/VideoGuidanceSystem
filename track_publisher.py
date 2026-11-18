@@ -7,7 +7,8 @@ Topics (prefix set by the node's topic_prefix parameter, default /perception):
                           is in view). One Detection2D per confirmed person:
                             id                        their ID ("3"), the same one shown and logged
                             bbox                      box in image pixels (center + size)
-                            results[0].hypothesis     class_id "person", score = YOLO confidence
+                            results[0].hypothesis     class_id = class name ("person", "car", ...),
+                                                      score = YOLO confidence
                           header = the camera image's header (same stamp and frame_id).
 
   <prefix>/tracks_3d      vision_msgs/Detection3DArray, every processed frame, only when the node
@@ -17,13 +18,13 @@ Topics (prefix set by the node's topic_prefix parameter, default /perception):
                             bbox.center.position      position in meters in the camera's optical
                                                       frame (x right, y down, z forward), torso
                             bbox.size                 approximate width, height (and depth) in m
-                            results[0].hypothesis     class_id "person", score
+                            results[0].hypothesis     class name, score
                           header.frame_id = the camera's frame, so tf2 can transform the positions
                           into the drone's or the map's frame.
 
   <prefix>/track_events   std_msgs/String holding JSON, one message per event, for example
                           {"event": "entered", "id": 3, "stamp": 1700000000.12,
-                           "how": "reidentified", "similarity": 0.81}
+                           "class": "person", "how": "reidentified", "similarity": 0.81}
                           {"event": "left", "id": 3, "stamp": 1700000004.5,
                            "reason": "unseen for 3.2s"}
 
@@ -47,13 +48,13 @@ except ImportError:   # vision_msgs not installed
     Detection2DArray = None
 
 
-def _hypothesis(score):
+def _hypothesis(class_name, score):
     result = ObjectHypothesisWithPose()
     if hasattr(result, "hypothesis"):         # Humble and newer
-        result.hypothesis.class_id = "person"
+        result.hypothesis.class_id = class_name
         result.hypothesis.score = float(score)
     else:                                     # Foxy / Galactic
-        result.id = "person"
+        result.id = class_name
         result.score = float(score)
     return result
 
@@ -84,26 +85,27 @@ class TrackPublisher:
                          f"and {prefix}/track_events")
 
     def publish_frame(self, header, people, with_3d):
-        """people: (id, (x1, y1, x2, y2), confidence, position or None, size or None) per person,
-        position = (x, y, z) and size = (width, height, depth) in meters in the camera frame.
+        """people: (id, (x1, y1, x2, y2), confidence, position or None, size or None, class name)
+        per object, position = (x, y, z) and size = (width, height, depth) in meters in the camera
+        frame.
         with_3d: whether 3D positions can be known this frame (depth and camera_info present)."""
         if self.tracks is None:
             return
 
         array = Detection2DArray(header=header)
-        for person_id, (x1, y1, x2, y2), confidence, _, _ in people:
+        for person_id, (x1, y1, x2, y2), confidence, _, _, name in people:
             detection = Detection2D(header=header, id=str(person_id))
             _set_center_2d(detection.bbox, (x1 + x2) / 2, (y1 + y2) / 2)
             detection.bbox.size_x = float(x2 - x1)
             detection.bbox.size_y = float(y2 - y1)
-            detection.results.append(_hypothesis(confidence))
+            detection.results.append(_hypothesis(name, confidence))
             array.detections.append(detection)
         self.tracks.publish(array)
 
         if not with_3d:
             return
         array = Detection3DArray(header=header)
-        for person_id, _, confidence, position, size in people:
+        for person_id, _, confidence, position, size, name in people:
             if position is None:
                 continue
             detection = Detection3D(header=header, id=str(person_id))
@@ -112,14 +114,16 @@ class TrackPublisher:
             center.orientation.w = 1.0
             detection.bbox.size.x, detection.bbox.size.y, detection.bbox.size.z = (
                 float(v) for v in size)
-            result = _hypothesis(confidence)
+            result = _hypothesis(name, confidence)
             result.pose.pose = center
             detection.results.append(result)
             array.detections.append(detection)
         self.tracks_3d.publish(array)
 
-    def publish_event(self, event, person_id, stamp, **details):
+    def publish_event(self, event, person_id, stamp, object_class=None, **details):
         """event: "entered" or "left". details: extra JSON fields (None values are left out)."""
         message = {"event": event, "id": int(person_id), "stamp": round(float(stamp), 3)}
+        if object_class:
+            message["class"] = object_class
         message.update({k: v for k, v in details.items() if v is not None})
         self.events.publish(String(data=json.dumps(message)))

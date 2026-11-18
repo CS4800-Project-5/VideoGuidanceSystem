@@ -18,8 +18,9 @@ Metrics (times are image times, so a replayed rosbag gives the same numbers as t
                       longest stretch it was tracked without a gap
   re-identification   entries that got an old ID back by appearance vs. new IDs
 
-Detection accuracy against ground truth needs labeled data, which the CSV doesn't have; with
---people, IDs per real person is the main accuracy number for identity tracking.
+Detection accuracy against ground truth needs to know where the people really were, which the CSV
+doesn't have: scenario_test.py measures it in the simulation. With --people, IDs per real person
+is the main accuracy number for identity tracking.
 
 A file can hold several runs (the node appends). A new run starts where the frame count or the
 image time goes backwards.

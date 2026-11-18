@@ -18,6 +18,7 @@ Usage (after running ./setup_zed.sh once):
     zed-demo reid_threshold:=0.6              # re-identify returning people more readily
     zed-demo reid:=false                      # no re-identification (IDs only last stale_timeout)
     zed-demo world_frame:=map                 # with TF (Jetson + ZED wrapper): position-aware re-ID
+    zed-demo classes:="[person, car]"        # also track cars (re-ID is for people only)
     zed-demo uav:=true                        # on the drone: read the UAV pose and state from MAVROS
 
 Ctrl+C stops everything, and rosbag2 closes the bag cleanly.
@@ -113,6 +114,7 @@ def launch_setup(context):
                  "-p", "conf:=0.1",
                  "-p", ["min_hits:=", LaunchConfiguration("min_hits")],
                  # Re-identification: recognize returning people by appearance, no time limit.
+                 "-p", ["classes:=", LaunchConfiguration("classes")],
                  "-p", ["reid:=", LaunchConfiguration("reid")],
                  "-p", ["reid_threshold:=", LaunchConfiguration("reid_threshold")],
                  "-p", ["stale_timeout:=", stale_timeout],
@@ -153,6 +155,9 @@ def generate_launch_description():
         DeclareLaunchArgument("resolution", default_value="VGA",
                               description="ZED resolution: VGA (672x376) or HD720 (1280x720, more "
                                           "detail for far people, but depth takes ~4x the CPU; needs USB 3)"),
+        DeclareLaunchArgument("classes", default_value="[person]",
+                              description="Classes to detect and track (YOLO's COCO names), "
+                                          "e.g. \"[person, car]\"; re-identification is for people"),
         DeclareLaunchArgument("reid", default_value="true",
                               description="Recognize people who come back (left the view, or the camera "
                                           "left the room) by appearance, and give them their old ID"),

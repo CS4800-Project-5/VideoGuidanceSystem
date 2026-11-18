@@ -12,7 +12,14 @@ Checks, from the node's CSV log (~/yolo_tracking_log.csv, the node's csv_log par
                the SAME ID, re-identified by appearance; only one ID is used.
   occlusion    a box hides the person for --occlude-time seconds (less than stale_timeout); the
                person keeps the SAME ID, with no "left" event.
-Prints PASS/FAIL per check and the performance report; exits with 1 if a check failed.
+  accuracy     the scenario knows when the person is really in view (ground truth), so it
+               measures detection accuracy: the share of frames with the person in view in which
+               they were detected (and tracked with an ID), and the share of frames with no one in
+               view that still had a detection (false detections). The first --settle seconds
+               after each change are skipped, while the node catches up. Optional limits:
+               --min-detection-rate and --max-false-rate (percent).
+Prints PASS/FAIL per check, the detection accuracy and the performance report; exits with 1 if a
+check failed.
 
 Only needs Python and the gz CLI (like scenario.py), not ROS.
 """
@@ -59,6 +66,55 @@ def ids_seen(rows):
     return {r["track_id"] for r in rows if r["record_type"] == "detection"}
 
 
+class Accuracy:
+    """Detection accuracy against the scenario's ground truth (is the person really in view?)."""
+
+    def __init__(self, settle):
+        self.settle = settle
+        self.in_view = [0, 0]      # frames with the person in view: [detected, total]
+        self.empty = [0, 0]        # frames with no one in view: [with a detection, total]
+
+    def add(self, person_in_view, rows):
+        """Rows logged while the person was (True) or was not (False) in view."""
+        frames = {}
+        for row in rows:
+            if row["record_type"] not in ("detection", "frame"):
+                continue
+            stamp = evaluate_tracking.number(row["image_stamp"])
+            frame = frames.setdefault(row["frame_count"], [stamp, False])
+            frame[1] = frame[1] or row["record_type"] == "detection"
+        stamps = [stamp for stamp, _ in frames.values() if stamp is not None]
+        if not stamps:
+            return
+        start = min(stamps)
+        counts = self.in_view if person_in_view else self.empty
+        for stamp, detected in frames.values():
+            if stamp is None or stamp - start < self.settle:
+                continue
+            counts[0] += detected
+            counts[1] += 1
+
+    @staticmethod
+    def percent(counts):
+        return 100.0 * counts[0] / counts[1] if counts[1] else None
+
+    def report(self, checks, min_detection_rate=None, max_false_rate=None):
+        print("\nDetection accuracy (ground truth from the scenario):")
+        rate, false_rate = self.percent(self.in_view), self.percent(self.empty)
+        if rate is not None:
+            print(f"  Person in view:  detected in {self.in_view[0]} of {self.in_view[1]} frames "
+                  f"({rate:.1f}%)")
+        if false_rate is not None:
+            print(f"  No one in view:  false detections in {self.empty[0]} of {self.empty[1]} frames "
+                  f"({false_rate:.1f}%)")
+        if min_detection_rate is not None:
+            checks.check(rate is not None and rate >= min_detection_rate,
+                         f"detection rate at least {min_detection_rate}%")
+        if max_false_rate is not None:
+            checks.check(false_rate is not None and false_rate <= max_false_rate,
+                         f"false detections at most {max_false_rate}%")
+
+
 class Checks:
     def __init__(self):
         self.failed = 0
@@ -69,21 +125,24 @@ class Checks:
         return ok
 
 
-def start_out_of_view(stale_timeout):
+def start_out_of_view(log, accuracy, stale_timeout):
     """Person out of view and the box away, and long enough for the node to log them as left."""
+    log.new_rows()
     if not scenario.spawn_from_file(scenario.PERSON_NAME, scenario.PERSON_SDF, scenario.PERSON_OUT_OF_VIEW):
         scenario.set_pose(scenario.PERSON_NAME, scenario.PERSON_OUT_OF_VIEW)
     if not scenario.spawn_from_string(scenario.OCCLUDER_NAME, scenario.OCCLUDER_SDF, scenario.OCCLUDER_AWAY):
         scenario.set_pose(scenario.OCCLUDER_NAME, scenario.OCCLUDER_AWAY)
     scenario.wait(stale_timeout + 3, "start with no one in view")
+    accuracy.add(False, log.new_rows())
 
 
-def test_entry_exit(log, checks, hold):
+def test_entry_exit(log, checks, accuracy, hold):
     print("\n=== Entry / exit ===")
     log.new_rows()
     scenario.set_pose(scenario.PERSON_NAME, scenario.PERSON_IN_VIEW)
     scenario.wait(hold, "person in view")
     first = log.new_rows()
+    accuracy.add(True, first)
     if not checks.check(bool(first), "the node is logging (CSV rows are being written)"):
         print("    Is the node running, with the CSV on (csv_log)? Is this the right file?")
         return []
@@ -95,12 +154,14 @@ def test_entry_exit(log, checks, hold):
     scenario.set_pose(scenario.PERSON_NAME, scenario.PERSON_OUT_OF_VIEW)
     scenario.wait(hold, "person out of view")
     away = log.new_rows()
+    accuracy.add(False, away)
     checks.check(any(r["track_id"] == person for r in events(away, "left")),
                  f"ID {person} left after the stale timeout")
 
     scenario.set_pose(scenario.PERSON_NAME, scenario.PERSON_IN_VIEW)
     scenario.wait(hold, "person back in view")
     back = log.new_rows()
+    accuracy.add(True, back)
     returned = events(back, "entered")
     checks.check(bool(returned) and returned[0]["track_id"] == person,
                  f"came back with the same ID {person} (got {[r['track_id'] for r in returned]})")
@@ -111,13 +172,14 @@ def test_entry_exit(log, checks, hold):
     return all_rows
 
 
-def test_occlusion(log, checks, hold, occlude_time):
+def test_occlusion(log, checks, accuracy, hold, occlude_time):
     print("\n=== Temporary occlusion ===")
     log.new_rows()
     scenario.set_pose(scenario.OCCLUDER_NAME, scenario.OCCLUDER_AWAY)
     scenario.set_pose(scenario.PERSON_NAME, scenario.PERSON_IN_VIEW)
     scenario.wait(hold, "person in view")
     before = log.new_rows()
+    accuracy.add(True, before)
     seen = ids_seen(before[len(before) // 2:])          # the settled second half
     if not checks.check(len(seen) == 1, f"one person tracked before the occlusion (saw {sorted(seen)})"):
         return before
@@ -125,9 +187,12 @@ def test_occlusion(log, checks, hold, occlude_time):
 
     scenario.set_pose(scenario.OCCLUDER_NAME, scenario.OCCLUDER_BLOCKING)
     scenario.wait(occlude_time, "person hidden")
+    hidden = log.new_rows()             # partly visible while the box moves: not counted
     scenario.set_pose(scenario.OCCLUDER_NAME, scenario.OCCLUDER_AWAY)
     scenario.wait(hold, "box moved away")
     after = log.new_rows()
+    accuracy.add(True, after)
+    after = hidden + after
     checks.check(not any(r["track_id"] == person for r in events(after, "left")),
                  f"ID {person} was not logged as left while hidden")
     later = ids_seen(after[len(after) // 2:])
@@ -144,21 +209,29 @@ def main():
                         help="seconds the box hides the person (less than the stale timeout)")
     parser.add_argument("--stale-timeout", type=float, default=3.0, help="the node's stale_timeout")
     parser.add_argument("--csv", default=os.environ.get("YOLO_LOG_CSV", "~/yolo_tracking_log.csv"))
+    parser.add_argument("--settle", type=float, default=1.0,
+                        help="seconds skipped after each change when measuring accuracy")
+    parser.add_argument("--min-detection-rate", type=float,
+                        help="fail below this %% of in-view frames with the person detected")
+    parser.add_argument("--max-false-rate", type=float,
+                        help="fail above this %% of empty frames with a detection")
     args = parser.parse_args()
 
     if not os.path.exists(scenario.PERSON_SDF):
         sys.exit(f"Person model not found at {scenario.PERSON_SDF} (README, Setup step 3)")
     log = CsvFollower(os.path.expanduser(args.csv))
     checks = Checks()
+    accuracy = Accuracy(args.settle)
     started = time.monotonic()
 
-    start_out_of_view(args.stale_timeout)
+    start_out_of_view(log, accuracy, args.stale_timeout)
     rows = []
     if args.scenario in ("entry_exit", "all"):
-        rows += test_entry_exit(log, checks, args.hold)
+        rows += test_entry_exit(log, checks, accuracy, args.hold)
     if args.scenario in ("occlusion", "all"):
-        rows += test_occlusion(log, checks, args.hold, args.occlude_time)
+        rows += test_occlusion(log, checks, accuracy, args.hold, args.occlude_time)
 
+    accuracy.report(checks, args.min_detection_rate, args.max_false_rate)
     if rows:
         print()
         evaluate_tracking.print_report(evaluate_tracking.evaluate(rows, people=1), 1, 1)

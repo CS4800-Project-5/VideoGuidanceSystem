@@ -91,7 +91,7 @@ assumes a still camera and lost people every time the camera moved.
 | --- | --- |
 | Accept simulated camera images through ROS 2 | ✅ Done |
 | Obtain UAV pose/state from PX4 through MAVROS | ✅ `uav_state.py` reads pose and state (`mavros:=true` in the sim); shown in the status log, saved in the CSV, optionally published to TF. Missing or late messages only log a warning |
-| Detect objects of specified target classes | 🟡 Person class only (`classes=[0]`); not yet configurable |
+| Detect objects of specified target classes | ✅ `classes` parameter / launch argument, by YOLO's COCO names (default `[person]`, e.g. `classes:="[person, car]"`); class shown in the window, topics, CSV and events. Re-identification by appearance is for people only |
 | Bounding box, class label, and confidence per detection | ✅ Shown in the visualization and published on `/perception/tracks` |
 | Assign persistent IDs | ✅ BoT-SORT, plus appearance re-identification so a person keeps their ID after leaving and returning (no time limit by default) |
 | Associate detections with existing tracks across frames | ✅ BoT-SORT |
@@ -101,7 +101,7 @@ assumes a still camera and lost people every time the camera moved.
 | Publish detections and tracks through documented ROS 2 interfaces | ✅ `/perception/tracks`, `/perception/tracks_3d`, `/perception/track_events` ([ROS topics](#ros-topics-for-other-groups)) |
 | Visualize boxes, classes, confidences, and IDs | ✅ OpenCV window |
 | Log detection and tracking results for analysis | ✅ CSV file (`csv_log`, default `~/yolo_tracking_log.csv`), ROS logs, optional rosbag |
-| Measure performance (accuracy, track continuity, latency, FPS) | 🟡 `evaluate_tracking.py` reports frame rate, latency, detection rate, IDs per real person and track continuity; no labeled ground truth for detection accuracy yet |
+| Measure performance (accuracy, track continuity, latency, FPS) | ✅ `scenario_test.py` measures detection accuracy against the simulation's ground truth (detection rate with the person in view, false detections with no one in view); `evaluate_tracking.py` reports frame rate, latency, IDs per real person and track continuity |
 | Automated tests with repeatable scenarios | ✅ Simulation scenarios checked automatically (`scenario_test.py`), rosbag replay with limits (`replay_test.py`) |
 
 ## Setup
@@ -279,6 +279,7 @@ Press Ctrl+C in Terminal 1. Then repeat the check from [Before you start](#befor
 | `viewer` | `false` | Show the raw camera feed (`image_tools showimage`) |
 | `record` | `false` | Record the camera topic, `/rosout` and the `/perception` topics to a rosbag |
 | `bag_name` | `object_tracking_test` | Output folder for the rosbag |
+| `classes` | `[person]` | Classes to detect and track (YOLO's COCO names), e.g. `classes:="[person, car]"` |
 | `reid` | `true` | Recognize returning people by appearance |
 | `stale_timeout` | `3.0` | Seconds before an unseen object counts as having left |
 | `show_window` | `true` | Show the OpenCV tracking window |
@@ -292,6 +293,7 @@ The simulation uses the ZED's tracking settings except that tracking starts at 2
 | Parameter | Default | What it does |
 | --- | --- | --- |
 | `stale_timeout` | `3.0` | Seconds (image time) without a detection before an object counts as having left |
+| `classes` | `["person"]` | Classes to detect and track, by YOLO's COCO names (`person`, `car`, `truck`, `bicycle`, `dog`, ...). Unknown names are logged and ignored. Re-identification applies to people only; other objects keep their ID through BoT-SORT |
 | `tracker` | `botsort_zed.yaml` | BoT-SORT settings file (`sim.launch.py` passes `botsort_sim.yaml`) |
 | `conf` | `0.1` | Lowest YOLO confidence passed to the tracker (weak detections only keep existing tracks alive) |
 | `min_hits` | `3` | Frames in a row a person must be tracked before getting an ID |
@@ -334,9 +336,9 @@ repo has to be built to subscribe. Every message carries the camera image's head
 
 | Topic | Type | When | Contents |
 | --- | --- | --- | --- |
-| `/perception/tracks` | `vision_msgs/Detection2DArray` | every processed frame (empty when no one is in view) | one `Detection2D` per person: `id` = their ID (`"3"`), `bbox` in image pixels, `results[0].hypothesis` = `person` and the YOLO confidence |
+| `/perception/tracks` | `vision_msgs/Detection2DArray` | every processed frame (empty when nothing is in view) | one `Detection2D` per tracked object: `id` = its ID (`"3"`), `bbox` in image pixels, `results[0].hypothesis` = class name (`person`, `car`, ...) and the YOLO confidence |
 | `/perception/tracks_3d` | `vision_msgs/Detection3DArray` | every processed frame, only with depth (the ZED) | one `Detection3D` per person whose distance is known: `id`, `bbox.center.position` = torso position in meters in the camera's optical frame (x right, y down, z forward), `bbox.size` = approximate width/height |
-| `/perception/track_events` | `std_msgs/String` (JSON) | when someone enters or leaves | `{"event": "entered", "id": 3, "stamp": 1700000000.12, "how": "reidentified", "similarity": 0.81}` or `{"event": "left", "id": 3, "stamp": ..., "reason": "unseen for 3.2s"}` |
+| `/perception/track_events` | `std_msgs/String` (JSON) | when someone enters or leaves | `{"event": "entered", "id": 3, "stamp": 1700000000.12, "class": "person", "how": "reidentified", "similarity": 0.81}` or `{"event": "left", "id": 3, "stamp": ..., "reason": "unseen for 3.2s"}` |
 
 To get positions in the drone's or the map's frame, transform `tracks_3d` with tf2 using the
 message's `frame_id`. Quick checks:
@@ -403,8 +405,20 @@ python3 scenario_test.py entry_exit --hold 30
 It moves the person and the box like `scenario.py`, follows the node's CSV log and checks: the
 person enters and gets an ID, leaves after the stale timeout, comes back with the **same ID**
 (re-identified by appearance), only one ID is used, and a short occlusion keeps the ID with no
-"left" event. Each check prints PASS or FAIL, then the performance report; the exit code is 1 if
-any check failed.
+"left" event. Each check prints PASS or FAIL.
+
+Because the scenario knows when the person is really in view, it also measures **detection
+accuracy** against that ground truth:
+
+```
+Detection accuracy (ground truth from the scenario):
+  Person in view:  detected in 412 of 450 frames (91.6%)
+  No one in view:  false detections in 3 of 300 frames (1.0%)
+```
+
+"Detected" means detected and tracked with an ID. The first second after each change is skipped
+(`--settle`), while the node catches up. `--min-detection-rate 80 --max-false-rate 5` turn these
+into checks. Then comes the performance report; the exit code is 1 if any check failed.
 
 **Recorded footage.** Replays a rosbag (ZED or simulation) through the node with the matching
 settings and a temporary CSV, then checks the report against limits:
