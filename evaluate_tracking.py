@@ -146,6 +146,20 @@ def evaluate(rows, people=None):
     return result
 
 
+def check_limits(result, min_fps=None, max_latency_p95=None, max_ids_per_person=None):
+    """The limits a run misses, as text (empty if it meets them all, or none were given)."""
+    failures = []
+    if min_fps is not None and (result.get("fps") or 0) < min_fps:
+        failures.append(f"frame rate {result.get('fps')} < {min_fps}")
+    p95 = result.get("latency_ms", {}).get("p95")
+    if max_latency_p95 is not None and (p95 is None or p95 > max_latency_p95):
+        failures.append(f"latency p95 {p95} ms > {max_latency_p95}")
+    per_person = result["ids"]["per_person"]
+    if max_ids_per_person is not None and (per_person is None or per_person > max_ids_per_person):
+        failures.append(f"IDs per person {per_person} > {max_ids_per_person}")
+    return failures
+
+
 def print_report(result, run_number, run_count):
     print(f"Run {run_number} of {run_count}: {result['frames']} frames"
           + (f", {result['duration_s']} s" if "duration_s" in result else ""))
@@ -210,15 +224,7 @@ def main():
     else:
         print_report(result, index + 1, len(runs))
 
-    failures = []
-    if args.min_fps is not None and (result.get("fps") or 0) < args.min_fps:
-        failures.append(f"frame rate {result.get('fps')} < {args.min_fps}")
-    p95 = result.get("latency_ms", {}).get("p95")
-    if args.max_latency_p95 is not None and (p95 is None or p95 > args.max_latency_p95):
-        failures.append(f"latency p95 {p95} ms > {args.max_latency_p95}")
-    per_person = result["ids"]["per_person"]
-    if args.max_ids_per_person is not None and (per_person is None or per_person > args.max_ids_per_person):
-        failures.append(f"IDs per person {per_person} > {args.max_ids_per_person}")
+    failures = check_limits(result, args.min_fps, args.max_latency_p95, args.max_ids_per_person)
     if failures:
         print("\nFAILED: " + "; ".join(failures), file=sys.stderr)
         sys.exit(1)

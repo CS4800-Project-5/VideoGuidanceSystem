@@ -75,6 +75,9 @@ assumes a still camera and lost people every time the camera moved.
 | `track_publisher.py` | Publishes the tracked people and entered/left events as ROS topics for other groups ([ROS topics](#ros-topics-for-other-groups)). |
 | `tracking_logger.py` | Writes the same detections and events to a CSV file for analysis. |
 | `uav_state.py` | Reads the UAV's pose and state (armed, flight mode) from PX4 through MAVROS; optionally publishes the pose to TF. |
+| `scenario_test.py` | Automated simulation test: runs the scenarios and checks the logged events and IDs ([Automated tests](#automated-tests)). |
+| `replay_test.py` | Replays a recorded rosbag through the node and checks the performance report against limits. |
+| `tests/` | Unit tests (pytest) for re-identification, logging, evaluation, the ROS topics, MAVROS input and the node's tracking logic. |
 | `evaluate_tracking.py` | Performance report from the CSV log: frame rate, latency, detection rate, IDs per person, track continuity, re-identification ([Measuring performance](#measuring-performance)). |
 | `scenario.py` | Repeatable Gazebo test scenarios (entry/exit and occlusion) driven by the `gz` CLI. |
 | `zed.launch.py` | The real ZED camera on a laptop: camera + YOLO node, with each person's distance. |
@@ -100,7 +103,7 @@ assumes a still camera and lost people every time the camera moved.
 | Visualize boxes, classes, confidences, and IDs | ✅ OpenCV window |
 | Log detection and tracking results for analysis | ✅ CSV file (`csv_log`, default `~/yolo_tracking_log.csv`), ROS logs, optional rosbag |
 | Measure performance (accuracy, track continuity, latency, FPS) | 🟡 `evaluate_tracking.py` reports frame rate, latency, detection rate, IDs per real person and track continuity; no labeled ground truth for detection accuracy yet |
-| Automated tests with repeatable scenarios | 🟡 `scenario.py` drives scenarios; results are checked by hand |
+| Automated tests with repeatable scenarios | ✅ Unit tests (`tests/`), simulation scenarios checked automatically (`scenario_test.py`), rosbag replay with limits (`replay_test.py`) |
 
 ## Setup
 
@@ -383,8 +386,53 @@ Limits make it usable in automated tests: `--min-fps`, `--max-latency-p95` (ms) 
 `--max-ids-per-person` make it exit with code 1 when a limit is missed, for example
 `python3 evaluate_tracking.py --people 3 --max-ids-per-person 1.5 --min-fps 5`.
 
-A recorded rosbag can be re-run through the node with different settings: start the node on its
-own ([Running the node on its own](#running-the-node-on-its-own)) and `ros2 bag play` the bag.
+A recorded rosbag can be re-run through the node with different settings with `replay_test.py`
+([Automated tests](#automated-tests)).
+
+## Automated tests
+
+Three levels, from quick to realistic:
+
+**1. Unit tests** (seconds; no simulation or camera needed):
+
+```bash
+cd ~/VideoGuidanceSystem
+source /opt/ros/humble/setup.bash
+~/yolo_ros2_env/bin/python -m pytest tests
+```
+
+They cover re-identification matching (angles, memory, ambiguity, position check), the CSV log,
+the performance report, the published topics, MAVROS input (including missing messages), the
+node's ID logic (confirmation, re-identification, look-alikes far away, two people in view), and
+`scenario_test.py` itself against a fake simulation. Without ROS sourced they still run, with
+stand-ins for the ROS message types (`tests/conftest.py`). The OSNet tests are skipped until
+`setup_zed.sh` has downloaded the weights. `setup_zed.sh` installs pytest.
+
+**2. Simulation scenarios, checked automatically.** With the simulation running (Terminal 1), in
+Terminal 2:
+
+```bash
+python3 scenario_test.py                  # entry/exit and occlusion, about 2.5 minutes
+python3 scenario_test.py entry_exit --hold 30
+```
+
+It moves the person and the box like `scenario.py`, follows the node's CSV log and checks: the
+person enters and gets an ID, leaves after the stale timeout, comes back with the **same ID**
+(re-identified by appearance), only one ID is used, and a short occlusion keeps the ID with no
+"left" event. Each check prints PASS or FAIL, then the performance report; the exit code is 1 if
+any check failed.
+
+**3. Recorded footage.** Replays a rosbag (ZED or simulation) through the node with the matching
+settings and a temporary CSV, then checks the report against limits:
+
+```bash
+python3 replay_test.py class1 --people 3 --max-ids-per-person 1.5 --min-fps 2
+python3 replay_test.py class1 --people 3 --param reid_threshold:=0.6     # compare a setting
+```
+
+Recording the same scene once (`zed-demo record:=true bag_name:=class1`) and replaying it after
+every change shows whether the change helped. The node keeps up at its own speed, so frame rate
+and results depend on the computer; use `--rate 0.5` on a slow one.
 
 ## Real ZED camera on a laptop
 
