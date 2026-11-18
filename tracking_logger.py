@@ -27,13 +27,27 @@ CSV_FIELDS = [
     "x_m",
     "y_m",
     "z_m",
+    "uav_x",
+    "uav_y",
+    "uav_z",
+    "uav_yaw",
     "processing_ms",
+    "detail",
 ]
 
 
 def utc_timestamp():
     """Return the current time in UTC as an ISO-8601 string."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _uav(uav_pose):
+    """UAV pose columns: (x, y, z in m, yaw in degrees) from MAVROS, or blanks if unknown."""
+    if uav_pose is None:
+        return {}
+    x, y, z, yaw = uav_pose
+    return {"uav_x": round(float(x), 3), "uav_y": round(float(y), 3),
+            "uav_z": round(float(z), 3), "uav_yaw": round(float(yaw), 1)}
 
 
 def _stamp(stamp):
@@ -103,11 +117,13 @@ class TrackingLogger:
         processing_ms,
         stamp=None,
         position=None,
+        uav_pose=None,
     ):
         """Record one YOLO detection and its optional tracker ID.
 
         stamp: the camera image's time in seconds. position: (x, y, z) in meters in the
-        camera frame, or None when the distance is unknown.
+        camera frame, or None when the distance is unknown. uav_pose: (x, y, z, yaw) from
+        MAVROS, or None.
         """
         x_m, y_m, z_m = ("", "", "") if position is None else (round(float(v), 3) for v in position)
         self.write(
@@ -127,9 +143,11 @@ class TrackingLogger:
             y_m=y_m,
             z_m=z_m,
             processing_ms=round(float(processing_ms), 3),
+            **_uav(uav_pose),
         )
 
-    def log_frame_without_detections(self, frame_count, processing_ms, stamp=None):
+    def log_frame_without_detections(self, frame_count, processing_ms, stamp=None,
+                                     uav_pose=None):
         """Record a processed frame in which no detections were returned."""
         self.write(
             image_stamp=_stamp(stamp),
@@ -137,10 +155,13 @@ class TrackingLogger:
             record_type="frame",
             event="no_detection",
             processing_ms=round(float(processing_ms), 3),
+            **_uav(uav_pose),
         )
 
-    def log_tracking_event(self, frame_count, event, track_id, processing_ms, stamp=None):
-        """Record a track entry or exit event. processing_ms may be "" (not measured)."""
+    def log_tracking_event(self, frame_count, event, track_id, processing_ms, stamp=None,
+                           detail=""):
+        """Record a track entry or exit event. processing_ms may be "" (not measured).
+        detail: e.g. "new", "reidentified 0.812" or "unseen for 3.2s"."""
         self.write(
             image_stamp=_stamp(stamp),
             frame_count=frame_count,
@@ -148,6 +169,7 @@ class TrackingLogger:
             event=event,
             track_id=track_id,
             processing_ms="" if processing_ms == "" else round(float(processing_ms), 3),
+            detail=detail,
         )
 
     def log_processing_error(self, frame_count, error):

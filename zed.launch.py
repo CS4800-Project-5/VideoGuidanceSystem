@@ -18,6 +18,7 @@ Usage (after running ./setup_zed.sh once):
     zed-demo reid_threshold:=0.6              # re-identify returning people more readily
     zed-demo reid:=false                      # no re-identification (IDs only last stale_timeout)
     zed-demo world_frame:=map                 # with TF (Jetson + ZED wrapper): position-aware re-ID
+    zed-demo uav:=true                        # on the drone: read the UAV pose and state from MAVROS
 
 Ctrl+C stops everything, and rosbag2 closes the bag cleanly.
 """
@@ -71,6 +72,10 @@ def launch_setup(context):
             Shutdown(reason="setup missing"),
         ]
 
+    # Passed only when set: an empty "-p name:=" would not be read as an empty string.
+    world_frame = LaunchConfiguration("world_frame").perform(context)
+    optional = ["-p", f"world_frame:={world_frame}"] if world_frame else []
+
     flip = LaunchConfiguration("flip")
     stale_timeout = LaunchConfiguration("stale_timeout")
     show_window = LaunchConfiguration("show_window")
@@ -110,9 +115,11 @@ def launch_setup(context):
                  # Re-identification: recognize returning people by appearance, no time limit.
                  "-p", ["reid:=", LaunchConfiguration("reid")],
                  "-p", ["reid_threshold:=", LaunchConfiguration("reid_threshold")],
-                 "-p", ["world_frame:=", LaunchConfiguration("world_frame")],
                  "-p", ["stale_timeout:=", stale_timeout],
-                 "-p", ["show_window:=", show_window]],
+                 "-p", ["show_window:=", show_window],
+                 # UAV pose/state from MAVROS: only with uav:=true (no drone on a laptop).
+                 "-p", ["uav:=", LaunchConfiguration("uav")],
+                 *optional],
             # yolov8n.pt is loaded from the repo folder (setup_zed.sh downloads it there), so no
             # internet is needed when this runs.
             cwd=HERE,
@@ -157,6 +164,8 @@ def generate_launch_description():
                                           "positions; re-ID then rules out people last seen too far "
                                           "away. Empty = off (needs a TF publisher, e.g. the ZED "
                                           "wrapper's positional tracking on the Jetson)"),
+        DeclareLaunchArgument("uav", default_value="false",
+                              description="Read the UAV pose and state from MAVROS (on the drone)"),
         DeclareLaunchArgument("min_hits", default_value="3",
                               description="Frames in a row a person must be tracked before getting an ID"),
         DeclareLaunchArgument("show_window", default_value="true",

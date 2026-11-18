@@ -23,6 +23,7 @@ except ImportError:   # tf2_ros missing: no world positions, re-ID on appearance
 from reidentifier import ReIdentifier, make_extractor, mean_feature
 from track_publisher import TrackPublisher
 from tracking_logger import TrackingLogger
+from uav_state import UavState
 
 
 # Default camera: the Gazebo simulation. zed.launch.py sets camera_topic and depth_topic
@@ -196,6 +197,22 @@ class YoloCameraNode(Node):
         self.csv = TrackingLogger(csv_log) if csv_log else None
         if self.csv is not None:
             self.get_logger().info(f"Logging detections and events to {self.csv.log_path}")
+
+        # ---- UAV pose and state from PX4 through MAVROS (uav_state.py) ----
+        # uav:=false = don't read MAVROS (e.g. the ZED on a laptop, where there is no drone).
+        mavros_ns = self.declare_parameter("mavros_ns", "/mavros").value
+        self.uav = None
+        if bool(self.declare_parameter("uav", True).value) and mavros_ns:
+            self.uav = UavState(
+                self, mavros_ns,
+                # Seconds without a pose/state message before it counts as missing.
+                stale_after=float(self.declare_parameter(
+                    "uav_timeout", 1.0, ParameterDescriptor(dynamic_typing=True)).value),
+                # Publish the UAV pose to TF (map -> base_link). Off when something else
+                # (e.g. the ZED wrapper) already publishes that TF.
+                publish_tf=bool(self.declare_parameter("uav_publish_tf", False).value),
+            )
+            self.create_timer(0.5, self.uav.check)
 
         # Entry/exit tracking state.
         # A track is stale once it has not been seen for stale_timeout seconds.
@@ -381,12 +398,14 @@ class YoloCameraNode(Node):
             self.publisher.publish_frame(message.header, published, with_3d)
             processing_ms = (time.perf_counter() - started) * 1000
             if self.csv is not None:
+                uav_pose = self.uav.current_pose() if self.uav is not None else None
                 for person_id, box, confidence, position, _ in published:
                     self.csv.log_detection(self.frame_count, person_id, 0, "person", confidence,
-                                           box, processing_ms, stamp=stamp, position=position)
+                                           box, processing_ms, stamp=stamp, position=position,
+                                           uav_pose=uav_pose)
                 if not published:
                     self.csv.log_frame_without_detections(self.frame_count, processing_ms,
-                                                          stamp=stamp)
+                                                          stamp=stamp, uav_pose=uav_pose)
 
             # A newly observed ID means that an object entered the view.
             for track_id in current_ids:
@@ -430,8 +449,11 @@ class YoloCameraNode(Node):
             event, display_id, stamp, reason=reason, how=how,
             similarity=None if score is None or how != "reidentified" else round(score, 3))
         if self.csv is not None:
+            detail = reason or how or ""
+            if how == "reidentified" and score is not None:
+                detail = f"reidentified {score:.3f}"
             self.csv.log_tracking_event(self.frame_count, event, display_id, processing_ms,
-                                        stamp=stamp)
+                                        stamp=stamp, detail=detail)
 
     def reid_note(self, display_id):
         """How re-identification decided an ID, for the entered log line."""
@@ -463,6 +485,7 @@ class YoloCameraNode(Node):
             + (f", best {best * 100:.0f}%" if strong or weak else "")
             + f" -> tracker follows {tracked} -> {with_id} with an ID, {self.fps:.1f} fps"
             + (f", remembering {len(self.reid)} people" if self.reid is not None else "")
+            + (f"; {self.uav.summary()}" if self.uav is not None else "")
         )
 
     def confirmed_people(self, boxes, depth, frame, stamp, header):

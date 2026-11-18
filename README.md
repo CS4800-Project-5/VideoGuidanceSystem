@@ -58,6 +58,7 @@ yolo_camera_node.py
   ├─ BoT-SORT tracking with camera motion compensation (botsort_zed.yaml / botsort_sim.yaml)
   ├─ Appearance re-identification (reidentifier.py): same ID after leaving and returning
   ├─ Entry / exit / stale-track logic (stale_timeout param)
+  ├─ UAV pose and state from PX4 through MAVROS (uav_state.py)
   ├─ ROS topics for other groups (track_publisher.py) + CSV log (tracking_logger.py)
   └─ OpenCV window with boxes, labels, confidences, IDs
 ```
@@ -73,6 +74,8 @@ assumes a still camera and lost people every time the camera moved.
 | `botsort_zed.yaml`, `botsort_sim.yaml` | BoT-SORT tracker settings for the real camera and the simulation. |
 | `track_publisher.py` | Publishes the tracked people and entered/left events as ROS topics for other groups ([ROS topics](#ros-topics-for-other-groups)). |
 | `tracking_logger.py` | Writes the same detections and events to a CSV file for analysis. |
+| `uav_state.py` | Reads the UAV's pose and state (armed, flight mode) from PX4 through MAVROS; optionally publishes the pose to TF. |
+| `evaluate_tracking.py` | Performance report from the CSV log: frame rate, latency, detection rate, IDs per person, track continuity, re-identification ([Measuring performance](#measuring-performance)). |
 | `scenario.py` | Repeatable Gazebo test scenarios (entry/exit and occlusion) driven by the `gz` CLI. |
 | `zed.launch.py` | The real ZED camera on a laptop: camera + YOLO node, with each person's distance. |
 | `setup_zed.sh` | One-time setup for `zed.launch.py`, and the `zed-demo` command. |
@@ -85,7 +88,7 @@ assumes a still camera and lost people every time the camera moved.
 | Core requirement | Status |
 | --- | --- |
 | Accept simulated camera images through ROS 2 | ✅ Done |
-| Obtain UAV pose/state from PX4 through MAVROS | 🟡 MAVROS can be launched; the node does not use it yet |
+| Obtain UAV pose/state from PX4 through MAVROS | ✅ `uav_state.py` reads pose and state (`mavros:=true` in the sim); shown in the status log, saved in the CSV, optionally published to TF. Missing or late messages only log a warning |
 | Detect objects of specified target classes | 🟡 Person class only (`classes=[0]`); not yet configurable |
 | Bounding box, class label, and confidence per detection | ✅ Shown in the visualization and published on `/perception/tracks` |
 | Assign persistent IDs | ✅ BoT-SORT, plus appearance re-identification so a person keeps their ID after leaving and returning (no time limit by default) |
@@ -96,7 +99,7 @@ assumes a still camera and lost people every time the camera moved.
 | Publish detections and tracks through documented ROS 2 interfaces | ✅ `/perception/tracks`, `/perception/tracks_3d`, `/perception/track_events` ([ROS topics](#ros-topics-for-other-groups)) |
 | Visualize boxes, classes, confidences, and IDs | ✅ OpenCV window |
 | Log detection and tracking results for analysis | ✅ CSV file (`csv_log`, default `~/yolo_tracking_log.csv`), ROS logs, optional rosbag |
-| Measure performance (accuracy, track continuity, latency, FPS) | ❌ Not started |
+| Measure performance (accuracy, track continuity, latency, FPS) | 🟡 `evaluate_tracking.py` reports frame rate, latency, detection rate, IDs per real person and track continuity; no labeled ground truth for detection accuracy yet |
 | Automated tests with repeatable scenarios | 🟡 `scenario.py` drives scenarios; results are checked by hand |
 
 ## Setup
@@ -269,7 +272,7 @@ Press Ctrl+C in Terminal 1. Then repeat the check from [Before you start](#befor
 | `software_render` | `false` | Render on the CPU. Required in a VM. |
 | `px4` | `true` | Start PX4 SITL and Gazebo |
 | `yolo` | `true` | Start the YOLO node |
-| `mavros` | `false` | Start the MAVROS bridge to PX4 |
+| `mavros` | `false` | Start the MAVROS bridge to PX4, and have the node read the UAV pose and state from it |
 | `qgc` | `false` | Start QGroundControl |
 | `viewer` | `false` | Show the raw camera feed (`image_tools showimage`) |
 | `record` | `false` | Record the camera topic, `/rosout` and the `/perception` topics to a rosbag |
@@ -298,6 +301,10 @@ The simulation uses the ZED's tracking settings except that tracking starts at 2
 | `reid_threshold` | `-1` | How similar a new person must look to a remembered one to get their ID; -1 = the model's default (OSNet 0.65, color histogram 0.7) |
 | `reid_min_conf` | `0.3` | Lowest YOLO confidence at which a new appearance sample of a person is saved |
 | `world_frame` | empty | Fixed TF frame (`map`, `odom`) for world positions; turns on position checks in re-ID |
+| `uav` | `true` | Read the UAV pose and state from MAVROS (`sim.launch.py` sets it from `mavros`; `zed.launch.py` from its `uav` argument, default `false`) |
+| `mavros_ns` | `/mavros` | Namespace of the MAVROS topics |
+| `uav_timeout` | `1.0` | Seconds without a MAVROS message before it counts as missing (logged once; tracking continues) |
+| `uav_publish_tf` | `false` | Publish the UAV pose to TF (`map` -> `base_link`); on in the sim with `mavros:=true`. Leave off when the ZED wrapper publishes that TF |
 | `reid_max_speed` | `3.0` | With `world_frame`: fastest a person is assumed to walk (m/s) |
 | `topic_prefix` | `/perception` | Prefix of the published topics |
 | `csv_log` | `~/yolo_tracking_log.csv` | CSV file for detections and events; empty = no CSV |
@@ -339,8 +346,45 @@ ros2 topic hz /perception/tracks
 ```
 
 The same detections and events also go to a CSV file (`~/yolo_tracking_log.csv`, set with
-`csv_log`), one row per person per frame, with the image time and 3D position. A CSV written with
-older columns is renamed (`.before-<time>.csv`) and a new one is started.
+`csv_log`), one row per person per frame, with the image time, 3D position and the UAV's pose from
+MAVROS. A CSV written with older columns is renamed (`.before-<time>.csv`) and a new one is started.
+
+The UAV's own pose and state are not republished: subscribe to MAVROS directly
+(`/mavros/local_position/pose`, `/mavros/state`).
+
+## Measuring performance
+
+`evaluate_tracking.py` turns the CSV log into a report. It needs only Python, so it also runs on a
+log copied to another computer.
+
+```bash
+python3 evaluate_tracking.py                     # the last run in ~/yolo_tracking_log.csv
+python3 evaluate_tracking.py --list              # the runs in the file (the node appends)
+python3 evaluate_tracking.py --run 2 --people 3  # run 2, in which 3 different people were filmed
+python3 evaluate_tracking.py --json              # machine-readable
+```
+
+```
+Run 2 of 2: 100 frames, 9.9 s
+  Frame rate         10.0 fps
+  Latency            mean 41.6 ms, median 42.0, 95% under 49.0, max 49.0
+  Detection          people in 70.0% of frames, 0.8 per frame, mean confidence 0.8
+  IDs                2 different, 1.0 per real person (1.0 is ideal)
+  Entries            3: 1 re-identified, 2 new
+  Track continuity   1.5 entries per ID (1 = never lost), longest stretch 2.4 s on average, ...
+  UAV pose           known in 50.0% of frames
+```
+
+**IDs per real person** is the main number for identity tracking: film a known number of people
+(walking around them, from above, from behind), pass `--people`, and compare runs or settings. 1.0
+means everyone kept one ID; 2.0 means each person was split into two IDs on average.
+
+Limits make it usable in automated tests: `--min-fps`, `--max-latency-p95` (ms) and
+`--max-ids-per-person` make it exit with code 1 when a limit is missed, for example
+`python3 evaluate_tracking.py --people 3 --max-ids-per-person 1.5 --min-fps 5`.
+
+A recorded rosbag can be re-run through the node with different settings: start the node on its
+own ([Running the node on its own](#running-the-node-on-its-own)) and `ros2 bag play` the bag.
 
 ## Real ZED camera on a laptop
 

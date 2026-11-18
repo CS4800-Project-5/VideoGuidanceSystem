@@ -50,7 +50,11 @@ def yolo_node(context):
     args = ["-p", f"stale_timeout:={LaunchConfiguration('stale_timeout').perform(context)}",
             "-p", f"show_window:={LaunchConfiguration('show_window').perform(context)}",
             "-p", f"tracker:={os.path.join(HERE, 'botsort_sim.yaml')}",
-            "-p", f"reid:={LaunchConfiguration('reid').perform(context)}"]
+            "-p", f"reid:={LaunchConfiguration('reid').perform(context)}",
+            # With MAVROS: read the drone's pose and state, and publish the pose to TF
+            # (map -> base_link); nothing else publishes TF in the simulation.
+            "-p", f"uav:={LaunchConfiguration('mavros').perform(context)}",
+            "-p", f"uav_publish_tf:={LaunchConfiguration('mavros').perform(context)}"]
     return [ExecuteProcess(
         cmd=[VENV_PYTHON, YOLO_NODE, "--ros-args", *args],
         # yolov8n.pt is loaded from (and downloaded to) the repo folder.
