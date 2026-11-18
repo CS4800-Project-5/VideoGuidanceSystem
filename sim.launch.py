@@ -6,6 +6,7 @@ Usage (source ROS once in the terminal, then launch):
     ros2 launch ./sim.launch.py
     ros2 launch ./sim.launch.py software_render:=true mavros:=true qgc:=true
     ros2 launch ./sim.launch.py record:=true bag_name:=object_occlusion_test
+    ros2 launch ./sim.launch.py tracker:=botsort   # same tracking settings as zed-demo
 
 Ctrl+C stops everything, and rosbag2 closes the bag cleanly.
 """
@@ -18,6 +19,7 @@ from launch.actions import (
     ExecuteProcess,
     GroupAction,
     IncludeLaunchDescription,
+    OpaqueFunction,
     SetEnvironmentVariable,
     UnsetEnvironmentVariable,
 )
@@ -28,6 +30,7 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 HOME = os.path.expanduser("~")
+HERE = os.path.dirname(os.path.realpath(__file__))
 
 # Paths are relative to whoever runs this, so it works on every teammate's machine.
 PX4_DIR = os.path.join(HOME, "PX4-Autopilot")
@@ -37,6 +40,36 @@ QGC_APPIMAGE = os.path.join(HOME, "Downloads", "QGroundControl-4.4.3.AppImage")
 
 CAMERA_TOPIC = "/world/default/model/x500_mono_cam_0/link/camera_link/sensor/camera/image"
 FCU_URL = "udp://127.0.0.1:14540@127.0.0.1:14580"
+
+
+def yolo_node(context):
+    """The YOLO node, with the tracking settings chosen by the `tracker` argument:
+    bytetrack: the original settings (ByteTrack, every 3rd frame, ID on first sight).
+    botsort:   the same settings as zed.launch.py (BoT-SORT with camera motion compensation,
+               every frame, weak detections kept for existing tracks, ID after 3 frames),
+               except tracking starts at 25% confidence (botsort_sim.yaml). Re-identification is
+               on unless reid:=false.
+    """
+    tracker = LaunchConfiguration("tracker").perform(context)
+    args = ["-p", f"stale_timeout:={LaunchConfiguration('stale_timeout').perform(context)}",
+            "-p", f"show_window:={LaunchConfiguration('show_window').perform(context)}"]
+    if tracker == "botsort":
+        # botsort_sim.yaml: botsort_zed.yaml, but it starts tracking at 25% confidence instead
+        # of 40%, because YOLO is less confident about the rendered person.
+        args += ["-p", f"tracker:={os.path.join(HERE, 'botsort_sim.yaml')}",
+                 "-p", "conf:=0.1",
+                 "-p", "min_hits:=3",
+                 "-p", "process_every:=1",
+                 "-p", f"reid:={LaunchConfiguration('reid').perform(context)}"]
+    elif tracker != "bytetrack":
+        raise ValueError(f"tracker must be 'bytetrack' or 'botsort', not '{tracker}'")
+    return [ExecuteProcess(
+        cmd=[VENV_PYTHON, YOLO_NODE, "--ros-args", *args],
+        # yolov8n.pt is loaded from (and downloaded to) the repo folder.
+        cwd=HERE,
+        output="screen",
+        emulate_tty=True,
+    )]
 
 
 def generate_launch_description():
@@ -61,6 +94,16 @@ def generate_launch_description():
                               description="Start QGroundControl"),
         DeclareLaunchArgument("yolo", default_value="true",
                               description="Start the YOLO + ByteTrack node"),
+        DeclareLaunchArgument("tracker", default_value="bytetrack",
+                              description="'bytetrack' (original settings) or 'botsort' "
+                                          "(same tracking settings as zed.launch.py)"),
+        DeclareLaunchArgument("reid", default_value="true",
+                              description="With tracker:=botsort: recognize returning objects by "
+                                          "appearance (reidentifier.py)"),
+        DeclareLaunchArgument("stale_timeout", default_value="3.0",
+                              description="Seconds an object can be out of view and keep its ID"),
+        DeclareLaunchArgument("show_window", default_value="true",
+                              description="Show the OpenCV window with boxes and IDs"),
         DeclareLaunchArgument("viewer", default_value="false",
                               description="Show the raw camera feed with image_tools"),
         DeclareLaunchArgument("record", default_value="false",
@@ -98,12 +141,10 @@ def generate_launch_description():
             output="screen",
         ),
 
-        # ---- Terminal 3: YOLO + ByteTrack node (runs with the venv's Python) ----
-        ExecuteProcess(
-            cmd=[VENV_PYTHON, YOLO_NODE],
-            output="screen",
-            emulate_tty=True,
+        # ---- Terminal 3: YOLO + tracker node (runs with the venv's Python) ----
+        GroupAction(
             condition=IfCondition(yolo),
+            actions=[OpaqueFunction(function=yolo_node)],
         ),
 
         # ---- Optional: raw camera viewer ----

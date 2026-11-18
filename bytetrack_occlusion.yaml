@@ -6,8 +6,9 @@ track_high_thresh: 0.25 # first-stage match threshold
 track_low_thresh: 0.1 # second-stage threshold for low-score matches
 new_track_thresh: 0.25 # start a new track if no match is at least this
 # Processed frames a lost track is kept before ByteTrack forgets its ID.
-# Set to about stale_timeout x FPS. The node logs its FPS and a suggested
-# value every 5 s, so copy that number here once you know your real FPS.
+# Only used for the first frames: the node then sets it to stale_timeout x the
+# measured FPS, so a hidden object keeps its ID for stale_timeout seconds on any
+# machine (sim, laptop or Jetson). Change stale_timeout, not this value.
 track_buffer: 45
 match_thresh: 0.8 # association similarity threshold
 fuse_score: True # fuse detection score with IoU for matching
