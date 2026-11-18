@@ -1,6 +1,7 @@
 """
-Real ZED camera on a laptop (no NVIDIA GPU needed) -> YOLO + ByteTrack node, with the distance
-to each person from the ZED's depth.
+Real ZED camera on a laptop (no NVIDIA GPU needed) -> YOLO + BoT-SORT node, with the distance
+to each person from the ZED's depth. The tracked people are published on /perception/tracks,
+/perception/tracks_3d and /perception/track_events (see track_publisher.py).
 
 The camera is read by zed_usb_publisher.py from another team's repo,
 https://github.com/ArnavSingh121/Proj_1 (folder zed_usb/), which is not part of this repo:
@@ -16,6 +17,7 @@ Usage (after running ./setup_zed.sh once):
     zed-demo imgsz:=960                       # more far-away people, ~2x slower
     zed-demo reid_threshold:=0.6              # re-identify returning people more readily
     zed-demo reid:=false                      # no re-identification (IDs only last stale_timeout)
+    zed-demo world_frame:=map                 # with TF (Jetson + ZED wrapper): position-aware re-ID
 
 Ctrl+C stops everything, and rosbag2 closes the bag cleanly.
 """
@@ -45,10 +47,12 @@ ZED_USB_DIR = os.path.join(HOME, "Proj_1", "zed_usb")
 ZED = "/zed/zed_node/"
 RGB_TOPIC = ZED + "rgb/color/rect/image"
 DEPTH_TOPIC = ZED + "depth/depth_registered"
+RGB_INFO_TOPIC = ZED + "rgb/color/rect/camera_info"
 RECORD_TOPICS = [
-    RGB_TOPIC, ZED + "rgb/color/rect/camera_info",
+    RGB_TOPIC, RGB_INFO_TOPIC,
     DEPTH_TOPIC, ZED + "depth/camera_info",
     "/rosout",
+    "/perception/tracks", "/perception/tracks_3d", "/perception/track_events",
 ]
 
 
@@ -85,11 +89,13 @@ def launch_setup(context):
             emulate_tty=True,
         ),
 
-        # ---- YOLO + ByteTrack node on the ZED topics (runs with the venv's Python) ----
+        # ---- YOLO + BoT-SORT node on the ZED topics (runs with the venv's Python) ----
         ExecuteProcess(
             cmd=[VENV_PYTHON, YOLO_NODE, "--ros-args",
                  "-p", f"camera_topic:={RGB_TOPIC}",
                  "-p", f"depth_topic:={DEPTH_TOPIC}",
+                 # Intrinsics: with depth, they give each person's 3D position (tracks_3d topic).
+                 "-p", f"camera_info_topic:={RGB_INFO_TOPIC}",
                  "-p", "camera_qos:=reliable",
                  # The ZED gives far fewer frames per second than the sim on a CPU: use every one.
                  "-p", "process_every:=1",
@@ -104,6 +110,7 @@ def launch_setup(context):
                  # Re-identification: recognize returning people by appearance, no time limit.
                  "-p", ["reid:=", LaunchConfiguration("reid")],
                  "-p", ["reid_threshold:=", LaunchConfiguration("reid_threshold")],
+                 "-p", ["world_frame:=", LaunchConfiguration("world_frame")],
                  "-p", ["stale_timeout:=", stale_timeout],
                  "-p", ["show_window:=", show_window]],
             # yolov8n.pt is loaded from the repo folder (setup_zed.sh downloads it there), so no
@@ -145,6 +152,11 @@ def generate_launch_description():
         DeclareLaunchArgument("reid_threshold", default_value="-1",
                               description="Appearance similarity needed to count as the same person; "
                                           "-1 = the model's default (OSNet 0.65)"),
+        DeclareLaunchArgument("world_frame", default_value="",
+                              description="Fixed TF frame (e.g. map or odom) for people's world "
+                                          "positions; re-ID then rules out people last seen too far "
+                                          "away. Empty = off (needs a TF publisher, e.g. the ZED "
+                                          "wrapper's positional tracking on the Jetson)"),
         DeclareLaunchArgument("min_hits", default_value="3",
                               description="Frames in a row a person must be tracked before getting an ID"),
         DeclareLaunchArgument("show_window", default_value="true",

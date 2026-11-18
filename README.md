@@ -55,17 +55,24 @@ ros_gz_image image_bridge  ──►  /world/default/model/x500_mono_cam_0/link/
         ▼
 yolo_camera_node.py
   ├─ YOLO detection (person class)
-  ├─ ByteTrack or BoT-SORT short-term tracking (bytetrack_occlusion.yaml / botsort_*.yaml)
+  ├─ BoT-SORT tracking with camera motion compensation (botsort_zed.yaml / botsort_sim.yaml)
   ├─ Appearance re-identification (reidentifier.py): same ID after leaving and returning
   ├─ Entry / exit / stale-track logic (stale_timeout param)
+  ├─ ROS topics for other groups (track_publisher.py) + CSV log (tracking_logger.py)
   └─ OpenCV window with boxes, labels, confidences, IDs
 ```
+
+The camera is always moving (handheld in tests, on the drone later), so tracking uses only
+BoT-SORT: it estimates the camera's own motion from the background and corrects for it. ByteTrack
+assumes a still camera and lost people every time the camera moved.
 
 | File | Purpose |
 | --- | --- |
 | `sim.launch.py` | One command that starts PX4 + Gazebo, the image bridge, the YOLO node, and optionally MAVROS, QGroundControl, a raw camera viewer, and rosbag recording. |
 | `yolo_camera_node.py` | ROS 2 node that detects and tracks objects and logs when objects enter or leave the view. |
-| `bytetrack_occlusion.yaml` | ByteTrack settings. `track_buffer` controls how long a hidden object keeps its ID. |
+| `botsort_zed.yaml`, `botsort_sim.yaml` | BoT-SORT tracker settings for the real camera and the simulation. |
+| `track_publisher.py` | Publishes the tracked people and entered/left events as ROS topics for other groups ([ROS topics](#ros-topics-for-other-groups)). |
+| `tracking_logger.py` | Writes the same detections and events to a CSV file for analysis. |
 | `scenario.py` | Repeatable Gazebo test scenarios (entry/exit and occlusion) driven by the `gz` CLI. |
 | `zed.launch.py` | The real ZED camera on a laptop: camera + YOLO node, with each person's distance. |
 | `setup_zed.sh` | One-time setup for `zed.launch.py`, and the `zed-demo` command. |
@@ -80,15 +87,15 @@ yolo_camera_node.py
 | Accept simulated camera images through ROS 2 | ✅ Done |
 | Obtain UAV pose/state from PX4 through MAVROS | 🟡 MAVROS can be launched; the node does not use it yet |
 | Detect objects of specified target classes | 🟡 Person class only (`classes=[0]`); not yet configurable |
-| Bounding box, class label, and confidence per detection | 🟡 Shown in the visualization; not published |
-| Assign persistent IDs | ✅ ByteTrack, or BoT-SORT, plus appearance re-identification so a person keeps their ID after leaving and returning (no time limit by default) |
-| Associate detections with existing tracks across frames | ✅ ByteTrack |
+| Bounding box, class label, and confidence per detection | ✅ Shown in the visualization and published on `/perception/tracks` |
+| Assign persistent IDs | ✅ BoT-SORT, plus appearance re-identification so a person keeps their ID after leaving and returning (no time limit by default) |
+| Associate detections with existing tracks across frames | ✅ BoT-SORT |
 | Handle objects entering and leaving the view | ✅ Logged as entry/exit events |
 | Handle temporary loss or occlusion | ✅ `track_buffer` keeps IDs through short occlusions |
 | Remove stale tracks after a configurable period | ✅ `stale_timeout` ROS parameter (default 3.0 s) |
-| Publish detections and tracks through documented ROS 2 interfaces | ❌ Not started |
+| Publish detections and tracks through documented ROS 2 interfaces | ✅ `/perception/tracks`, `/perception/tracks_3d`, `/perception/track_events` ([ROS topics](#ros-topics-for-other-groups)) |
 | Visualize boxes, classes, confidences, and IDs | ✅ OpenCV window |
-| Log detection and tracking results for analysis | 🟡 ROS logs + optional rosbag; no structured log yet |
+| Log detection and tracking results for analysis | ✅ CSV file (`csv_log`, default `~/yolo_tracking_log.csv`), ROS logs, optional rosbag |
 | Measure performance (accuracy, track continuity, latency, FPS) | ❌ Not started |
 | Automated tests with repeatable scenarios | 🟡 `scenario.py` drives scenarios; results are checked by hand |
 
@@ -110,7 +117,8 @@ Install ROS 2 Humble (`ros-humble-desktop`), Gazebo Harmonic, and PX4 (built wit
 ```bash
 sudo apt update
 sudo apt install ros-humble-ros-gzharmonic ros-humble-image-tools ros-humble-rosbag2 \
-                 ros-humble-mavros ros-humble-mavros-extras python3.10-venv
+                 ros-humble-mavros ros-humble-mavros-extras ros-humble-vision-msgs \
+                 ros-humble-tf2-ros-py python3.10-venv
 sudo /opt/ros/humble/lib/mavros/install_geographiclib_datasets.sh   # only needed for mavros:=true
 ```
 
@@ -145,7 +153,7 @@ ls ~/.gz/fuel/fuel.gazebosim.org/openrobotics/models/scrubs/2/model.sdf   # must
 ln -sf ~/VideoGuidanceSystem/yolo_camera_node.py ~/yolo_camera_node.py
 ```
 
-The node follows the symlink and loads `bytetrack_occlusion.yaml` from the repo folder. If you copy the file instead of linking it, copy the YAML next to it too.
+The node follows the symlink and loads its other files (the BoT-SORT YAML files, `reidentifier.py`, `track_publisher.py`, `tracking_logger.py`, the model weights) from the repo folder, so link it rather than copying it.
 
 ### 5. Check the install
 
@@ -210,10 +218,10 @@ If anything is listed, a previous run is still alive. Stop it with Ctrl+C in its
 ```bash
 cd ~/VideoGuidanceSystem          # required: ./sim.launch.py is a relative path
 source /opt/ros/humble/setup.bash
-ros2 launch ./sim.launch.py software_render:=true tracker:=botsort   # drop software_render on a machine with a real GPU
+ros2 launch ./sim.launch.py software_render:=true   # drop software_render on a machine with a real GPU
 ```
 
-`tracker:=botsort` uses the same tracking settings as the real ZED camera and turns on re-identification. After running `setup_zed.sh` once, the `sim-demo` command does the same (and adds `software_render:=true` in a VM).
+This uses the same tracking settings as the real ZED camera (BoT-SORT, re-identification on). After running `setup_zed.sh` once, the `sim-demo` command does the same (and adds `software_render:=true` in a VM). Run `setup_zed.sh` again after updating, so `sim-demo` stops passing the old `tracker:=botsort` option.
 
 This starts PX4, the Gazebo server and window, the camera bridge, and the YOLO node. It's ready when, after about 15–30 seconds:
 
@@ -241,7 +249,7 @@ Watch the YOLO window and the node's log lines in Terminal 1.
 | `entry_exit` | `Object entered camera view: ID 1` → `Object left camera view: ID 1 (unseen for 3.xs)` → `Object entered camera view: ID 1 (re-identified by appearance, similarity 0.xx)` |
 | `occlusion` | The person keeps the **same ID** after the box moves away |
 
-**Choosing `--hold`:** it is how long, in real seconds, the scenario waits at each step. It must be longer than the node's `stale_timeout` (3 s of *simulation* time) for "left" events to appear, so use more if your sim runs slower than real time. `--hold 25` also keeps the person away long enough that ByteTrack forgets them, so the return actually tests appearance re-identification.
+**Choosing `--hold`:** it is how long, in real seconds, the scenario waits at each step. It must be longer than the node's `stale_timeout` (3 s of *simulation* time) for "left" events to appear, so use more if your sim runs slower than real time. `--hold 25` also keeps the person away long enough that the tracker forgets them, so the return actually tests appearance re-identification.
 
 Every 5 seconds the node also logs what each stage sees, for example
 `Status: YOLO sees 1 people, best 37% -> tracker follows 1 -> 1 with an ID, 4.2 fps`. If a visible
@@ -264,28 +272,39 @@ Press Ctrl+C in Terminal 1. Then repeat the check from [Before you start](#befor
 | `mavros` | `false` | Start the MAVROS bridge to PX4 |
 | `qgc` | `false` | Start QGroundControl |
 | `viewer` | `false` | Show the raw camera feed (`image_tools showimage`) |
-| `record` | `false` | Record the camera topic and `/rosout` to a rosbag |
+| `record` | `false` | Record the camera topic, `/rosout` and the `/perception` topics to a rosbag |
 | `bag_name` | `object_tracking_test` | Output folder for the rosbag |
-| `tracker` | `bytetrack` | `bytetrack`: the original settings, ByteTrack on every 3rd frame, no re-ID. `botsort`: the same settings as `zed.launch.py` (BoT-SORT with camera motion compensation, every frame, an ID only after 3 frames in a row, re-ID on), except tracking starts at 25% confidence instead of 40% ([`botsort_sim.yaml`](botsort_sim.yaml)) because YOLO is less confident about the rendered person |
-| `reid` | `true` | With `tracker:=botsort`: recognize returning people by appearance |
+| `reid` | `true` | Recognize returning people by appearance |
 | `stale_timeout` | `3.0` | Seconds before an unseen object counts as having left |
 | `show_window` | `true` | Show the OpenCV tracking window |
 
 Example: `ros2 launch ./sim.launch.py software_render:=true record:=true bag_name:=occlusion_run1`. Ctrl+C closes the rosbag cleanly.
+
+The simulation uses the ZED's tracking settings except that tracking starts at 25% confidence instead of 40% ([`botsort_sim.yaml`](botsort_sim.yaml)), because YOLO is less confident about the rendered person.
 
 ### Node parameters
 
 | Parameter | Default | What it does |
 | --- | --- | --- |
 | `stale_timeout` | `3.0` | Seconds (image time) without a detection before an object counts as having left |
-| `reid` | `false` | Re-identify returning people by appearance (`sim.launch.py tracker:=botsort` and `zed.launch.py` turn it on) |
+| `tracker` | `botsort_zed.yaml` | BoT-SORT settings file (`sim.launch.py` passes `botsort_sim.yaml`) |
+| `conf` | `0.1` | Lowest YOLO confidence passed to the tracker (weak detections only keep existing tracks alive) |
+| `min_hits` | `3` | Frames in a row a person must be tracked before getting an ID |
+| `process_every` | `1` | Run YOLO on every Nth frame; raise it to save CPU |
+| `device` | `cpu` | Inference device, e.g. `cuda` on the Jetson (also used for re-ID) |
+| `reid` | `true` | Re-identify returning people by appearance |
+| `reid_model` | empty | OSNet weights file; empty = `osnet_x0_5` on a CPU, `osnet_ibn_x1_0` on a GPU |
 | `reid_memory` | `0.0` | Seconds a departed person is remembered for re-identification; 0 = as long as the program runs |
 | `reid_threshold` | `-1` | How similar a new person must look to a remembered one to get their ID; -1 = the model's default (OSNet 0.65, color histogram 0.7) |
-| `process_every` | `3` | Run YOLO on every Nth frame; raise it to save CPU |
-| `device` | `cpu` | Inference device, e.g. `cuda` on the Jetson |
+| `reid_min_conf` | `0.3` | Lowest YOLO confidence at which a new appearance sample of a person is saved |
+| `world_frame` | empty | Fixed TF frame (`map`, `odom`) for world positions; turns on position checks in re-ID |
+| `reid_max_speed` | `3.0` | With `world_frame`: fastest a person is assumed to walk (m/s) |
+| `topic_prefix` | `/perception` | Prefix of the published topics |
+| `csv_log` | `~/yolo_tracking_log.csv` | CSV file for detections and events; empty = no CSV |
+| `camera_info_topic` | empty | Camera intrinsics; with depth, gives 3D positions (`tracks_3d`) |
 | `status_period` | `5.0` | Seconds between status log lines; 0 turns them off |
 
-The camera, model and tracker parameters used by the real ZED are listed in [Real ZED camera on a laptop](#real-zed-camera-on-a-laptop).
+The camera and model parameters used by the real ZED are listed in [Real ZED camera on a laptop](#real-zed-camera-on-a-laptop).
 
 ### Running the node on its own
 
@@ -293,9 +312,35 @@ Useful against a rosbag replay, or to restart only the node while Gazebo keeps r
 
 ```bash
 source /opt/ros/humble/setup.bash
-~/yolo_ros2_env/bin/python ~/yolo_camera_node.py --ros-args -p stale_timeout:=3.0 -p reid:=true
+~/yolo_ros2_env/bin/python ~/yolo_camera_node.py --ros-args -p stale_timeout:=3.0
 # in another terminal, for a bag: ros2 bag play <bag_folder>
 ```
+
+## ROS topics for other groups
+
+The node publishes what it tracks so other groups (collision avoidance, path planning, mapping) can
+use it. Message types are standard ROS 2 packages (`vision_msgs`, `std_msgs`), so nothing from this
+repo has to be built to subscribe. Every message carries the camera image's header (`stamp` and
+`frame_id`).
+
+| Topic | Type | When | Contents |
+| --- | --- | --- | --- |
+| `/perception/tracks` | `vision_msgs/Detection2DArray` | every processed frame (empty when no one is in view) | one `Detection2D` per person: `id` = their ID (`"3"`), `bbox` in image pixels, `results[0].hypothesis` = `person` and the YOLO confidence |
+| `/perception/tracks_3d` | `vision_msgs/Detection3DArray` | every processed frame, only with depth (the ZED) | one `Detection3D` per person whose distance is known: `id`, `bbox.center.position` = torso position in meters in the camera's optical frame (x right, y down, z forward), `bbox.size` = approximate width/height |
+| `/perception/track_events` | `std_msgs/String` (JSON) | when someone enters or leaves | `{"event": "entered", "id": 3, "stamp": 1700000000.12, "how": "reidentified", "similarity": 0.81}` or `{"event": "left", "id": 3, "stamp": ..., "reason": "unseen for 3.2s"}` |
+
+To get positions in the drone's or the map's frame, transform `tracks_3d` with tf2 using the
+message's `frame_id`. Quick checks:
+
+```bash
+ros2 topic echo /perception/track_events
+ros2 topic echo /perception/tracks_3d --field detections
+ros2 topic hz /perception/tracks
+```
+
+The same detections and events also go to a CSV file (`~/yolo_tracking_log.csv`, set with
+`csv_log`), one row per person per frame, with the image time and 3D position. A CSV written with
+older columns is renamed (`.before-<time>.csv`) and a new one is started.
 
 ## Real ZED camera on a laptop
 
@@ -309,6 +354,7 @@ and publishes the same topics as the ZED ROS 2 wrapper on the Jetson:
 | --- | --- |
 | `/zed/zed_node/rgb/color/rect/image` | Color image (the node's `camera_topic`) |
 | `/zed/zed_node/depth/depth_registered` | Depth in meters, pixel-aligned with the color image (`depth_topic`) |
+| `/zed/zed_node/rgb/color/rect/camera_info` | Intrinsics of the color image (`camera_info_topic`), for 3D positions |
 
 With a depth topic, the node shows each person's distance (median depth over their torso; `? m`
 where stereo depth has a hole).
@@ -320,10 +366,10 @@ cd ~/VideoGuidanceSystem
 bash setup_zed.sh
 ```
 
-It clones Proj_1 to `~/Proj_1` (for the camera code), adds `lap` to `~/yolo_ros2_env` (ByteTrack
-needs it; otherwise it is downloaded on first run), saves `yolov8n.pt` in the repo folder, saves the
-camera's factory calibration, turns off USB autosuspend for the ZED, and adds the `zed-demo` command.
-After that, no internet is needed.
+It clones Proj_1 to `~/Proj_1` (for the camera code), adds `lap` to `~/yolo_ros2_env` (BoT-SORT
+needs it; otherwise it is downloaded on first run), saves the YOLO and OSNet weights in the repo
+folder, saves the camera's factory calibration, turns off USB autosuspend for the ZED, and adds the
+`zed-demo` and `sim-demo` commands. After that, no internet is needed.
 
 **Run** (in a new terminal; you can plug the camera in after starting):
 
@@ -331,7 +377,7 @@ After that, no internet is needed.
 zed-demo                                  # same as: ros2 launch ./zed.launch.py
 zed-demo flip:=true                       # camera mounted upside down
 zed-demo stale_timeout:=5.0               # people keep their ID for up to 5 s out of view
-zed-demo record:=true bag_name:=zed_test  # also record color, depth and /rosout to a rosbag
+zed-demo record:=true bag_name:=zed_test  # also record color, depth, /rosout and /perception topics
 ```
 
 In a VM, connect the camera to the VM first (VMware: **VM → Removable Devices → Stereolabs ZED →
@@ -339,7 +385,7 @@ Connect**). `zed-demo` keeps ROS 2 on this computer (`ROS_LOCALHOST_ONLY=1`) so 
 on a shared network don't mix in; run `export ROS_LOCALHOST_ONLY=1` in other terminals to see the
 topics, or launch with `localhost_only:=false`.
 
-**IDs through short gaps:** ByteTrack keeps a hidden person's ID for `track_buffer` processed frames.
+**IDs through short gaps:** BoT-SORT keeps a hidden person's ID for `track_buffer` processed frames.
 The node now sets that from `stale_timeout` and the measured frame rate, so a person who leaves the
 view and comes back within `stale_timeout` seconds keeps their ID on any machine (sim, laptop or
 Jetson). After longer they are logged as left and come back with a new ID.
@@ -367,24 +413,40 @@ Object entered camera view: ID 7 (new person; most similar remembered: ID 2 at 0
 How it works ([`reidentifier.py`](reidentifier.py), based on Angel's re-ID in `angel-branch`):
 
 1. While a new track is being confirmed (`min_hits` frames), each crop of the person goes through
-   **OSNet**, a small network trained to recognize the same person across cameras and angles
-   (`osnet_x0_5`, trained on MSMT17). Each crop becomes a 512-number appearance "fingerprint".
+   **OSNet**, a network trained to recognize the same person across cameras and angles (trained on
+   MSMT17). Each crop becomes a 512-number appearance "fingerprint".
 2. When the track is confirmed, the average fingerprint is compared with every remembered person
-   who is **not in view right now** (so two people in view never share an ID). The best match
+   who is **not in view right now** (so two people in view never share an ID). Each remembered
+   person scores by their **single most similar sample**, so a view from above or behind matches
+   the sample taken from that angle instead of being averaged with front views. The best match
    above `reid_threshold`, clearly better than the second best, gets that person's ID back;
    otherwise the person gets a new ID.
-3. Every 5 frames, a new sample of each person in clear view (confident, not overlapping anyone)
-   is added to their memory (up to 12 varied samples per person), so they are recognized from
-   different angles.
+3. Every 5 frames, a new sample of each person in clear view (at least `reid_min_conf` = 30%
+   confidence, so less certain views from above or behind are saved too, and not overlapping
+   anyone) is added to their memory. When a person's 12 samples are full, the sample most like
+   the others is dropped, so the memory keeps a spread of angles instead of only recent ones.
+4. With `world_frame` set (a TF frame such as `map` that stays fixed while the camera moves, e.g.
+   from the ZED wrapper's positional tracking on the Jetson), each person's last world position is
+   remembered too. A remembered person is only a candidate if they could have walked to the new
+   track's position since they were last seen (`reid_max_speed`, 3 m/s, plus 1 m for depth noise),
+   so a look-alike across the room can't take their ID.
 
-`setup_zed.sh` downloads the OSNet weights (`osnet_x0_5_msmt17.pth`, from torchreid's model zoo
-on Google Drive). Without them, re-identification falls back to clothing colors (Angel's color
-histogram), which mixes up people in similar clothes. Options:
+`setup_zed.sh` downloads two OSNet models from torchreid's model zoo on Google Drive:
+
+| Model | Default on | Notes |
+| --- | --- | --- |
+| `osnet_x0_5_msmt17.pth` | CPU (laptop, VM) | small and fast: ~60 ms for 3 people on a laptop CPU |
+| `osnet_ibn_x1_0_msmt17.pth` | GPU (`device:=cuda`, the Jetson) | full size, copes better with new viewpoints and lighting; ~10x the CPU time, so only practical on a GPU |
+
+`reid_model:=osnet_ibn_x1_0_msmt17.pth` forces the larger model on a CPU. Without either file,
+re-identification falls back to clothing colors (Angel's color histogram), which mixes up people
+in similar clothes. Options:
 
 | Option | Effect |
 | --- | --- |
 | `reid_threshold:=0.6` | similarity needed to count as the same person (default 0.65 with OSNet). Lower if returning people get new IDs; raise if two people get mixed up. The log lines show the scores |
 | `reid:=false` | turn re-identification off |
+| `world_frame:=map` | position check (needs TF from the camera to that frame) |
 
 It recognizes people by their whole appearance (mostly clothes and build), not faces, so someone
 who changes clothes gets a new ID, and people dressed alike can be confused. The memory is kept
@@ -416,19 +478,16 @@ It prints people found per frame, average confidence and time per frame for each
 **Expect** a few frames per second: the CPU computes both the stereo depth and YOLO. Depth has holes
 on plain walls and ceilings.
 
-New node parameters (defaults keep the simulation behavior unchanged):
+Node parameters the ZED launch sets differently from the defaults:
 
 | Parameter | Default | ZED launch |
 | --- | --- | --- |
 | `camera_topic` | Gazebo camera topic | `/zed/zed_node/rgb/color/rect/image` |
 | `depth_topic` | empty (no distances) | `/zed/zed_node/depth/depth_registered` |
+| `camera_info_topic` | empty (no 3D positions) | `/zed/zed_node/rgb/color/rect/camera_info` |
 | `camera_qos` | `sensor_data` | `reliable` (best effort drops the ZED's ~1 MB images) |
-| `process_every` | `3` | `1` |
+| `model` | `yolov8n.pt` | `yolo11s.pt` |
 | `imgsz` | `320` | `640` |
-| `show_window` | `true` | `true` (`false` on the drone) |
-| `tracker` | `bytetrack_occlusion.yaml` | `botsort_zed.yaml` |
-| `conf` | `0.35` | `0.1` |
-| `min_hits` | `1` | `3` |
 
 ## Agile process
 

@@ -1,9 +1,9 @@
-# BoT-SORT config for the Gazebo simulation (sim.launch.py tracker:=botsort). Same as
+# BoT-SORT config for the Gazebo simulation (sim.launch.py). Same as
 # botsort_zed.yaml except new_track_thresh: YOLO is less confident about the rendered person
 # (often 25-40%), so a 0.4 threshold would never start tracking them.
 # Docs: https://docs.ultralytics.com/modes/track
 #
-# Why not bytetrack_occlusion.yaml here: ByteTrack assumes the camera holds still. A handheld
+# Why BoT-SORT and not ByteTrack: ByteTrack assumes the camera holds still. A handheld
 # camera (or the drone) moving at a few frames per second shifts everyone far between frames, so
 # ByteTrack loses them and starts new IDs. BoT-SORT's global motion compensation (gmc_method)
 # estimates the camera's own motion from the background and corrects for it.

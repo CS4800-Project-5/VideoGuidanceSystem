@@ -1,6 +1,6 @@
 """Re-identification: recognize a person who comes back into view, by how they look.
 
-The tracker (ByteTrack / BoT-SORT) follows people from frame to frame by position, so someone who
+The tracker (BoT-SORT) follows people from frame to frame by position, so someone who
 leaves the view, or the whole camera leaving the room, ends their track; when they come back they
 get a new tracker ID. The ReIdentifier remembers what every person looked like, with no time limit,
 and gives a returning person their old ID if their appearance matches.
@@ -8,15 +8,19 @@ and gives a returning person their old ID if their appearance matches.
 How appearance is measured is a Strategy (AppearanceExtractor), so it can be swapped without
 touching the matching:
   - OSNetExtractor: a neural network trained for person re-identification (recognizing the same
-    person across different cameras and viewpoints). Default when its weights are installed.
+    person across different cameras and viewpoints). Default when its weights are installed:
+    osnet_ibn_x1_0 (full size, built to cope with new places and lighting), or the smaller,
+    faster osnet_x0_5.
   - ColorHistogramExtractor: clothing colors. No download needed, but people in similar clothes
     look alike to it. Used when the OSNet weights are missing.
 
 Based on Angel's reidentifier.py (angel-branch): the extractor Strategy and the color histogram come
 from there. Changed: no time limit by default, several appearance samples per person, matching
-against everyone not currently in view (so two people in view never share an ID), and OSNet.
+against everyone not currently in view (so two people in view never share an ID), OSNet, and
+(with a world frame) ruling out matches with people last seen too far away to have walked here.
 """
 
+import os
 from abc import ABC, abstractmethod
 
 import cv2
@@ -79,10 +83,17 @@ class OSNetExtractor(AppearanceExtractor):
     MEAN = np.array([0.485, 0.456, 0.406], np.float32)   # ImageNet normalization, as in training
     STD = np.array([0.229, 0.224, 0.225], np.float32)
 
-    def __init__(self, weights_path, variant="osnet_x0_5", device="cpu", min_height=40):
+    VARIANTS = ("osnet_ibn_x1_0", "osnet_x1_0", "osnet_x0_75", "osnet_x0_5", "osnet_x0_25")
+
+    def __init__(self, weights_path, variant=None, device="cpu", min_height=40):
         import torch
         import osnet
 
+        if variant is None:
+            # Take the architecture from the file name, e.g. osnet_ibn_x1_0_msmt17.pth.
+            name = os.path.basename(weights_path)
+            variant = next((v for v in self.VARIANTS if name.startswith(v)), "osnet_x0_5")
+        self.variant = variant
         self.torch = torch
         self.device = device
         self.min_height = min_height
@@ -136,18 +147,28 @@ class OSNetExtractor(AppearanceExtractor):
         return float(np.dot(a, b))
 
 
-def make_extractor(weights_path, logger=None):
-    """OSNet if its weights load, otherwise the color histogram (with a warning)."""
-    try:
-        extractor = OSNetExtractor(weights_path)
+def make_extractor(weights_paths, logger=None, device="cpu"):
+    """The first OSNet whose weights load (weights_paths: one path or a list, best first),
+    otherwise the color histogram (with a warning). device: "cpu" or "cuda"."""
+    if isinstance(weights_paths, str):
+        weights_paths = [weights_paths]
+    errors = []
+    for path in weights_paths:
+        if not path or not os.path.exists(path):
+            errors.append(f"{path} not found")
+            continue
+        try:
+            extractor = OSNetExtractor(path, device=device)
+        except Exception as error:
+            errors.append(f"{path}: {error}")
+            continue
         if logger:
-            logger.info(f"Re-ID: OSNet appearance model loaded from {weights_path}")
+            logger.info(f"Re-ID: OSNet appearance model {extractor.variant} loaded from {path}")
         return extractor
-    except Exception as error:
-        if logger:
-            logger.warn(f"Re-ID: OSNet not available ({error}); using clothing colors instead. "
-                        "Run setup_zed.sh (with internet) to download the OSNet weights.")
-        return ColorHistogramExtractor()
+    if logger:
+        logger.warn(f"Re-ID: OSNet not available ({'; '.join(errors)}); using clothing colors "
+                    "instead. Run setup_zed.sh (with internet) to download the OSNet weights.")
+    return ColorHistogramExtractor()
 
 
 class ReIdentifier:
@@ -157,42 +178,62 @@ class ReIdentifier:
     poses, lighting). A new track is compared with every remembered person who is not in view
     right now; the best match above the threshold, clearly better than the second best, gets
     that person's ID back. There is no time limit unless memory_seconds is set.
+
+    With positions in a fixed world frame (the node's world_frame parameter), a remembered person
+    is only a candidate if they could have walked from where they were last seen to where the new
+    track is, at max_speed m/s (plus position_slack m for depth noise).
     """
 
-    def __init__(self, extractor, threshold=None, memory_seconds=0.0, bank_size=12, margin=0.05):
+    def __init__(self, extractor, threshold=None, memory_seconds=0.0, bank_size=12, margin=0.05,
+                 max_speed=3.0, position_slack=1.0):
         self.extractor = extractor
         self.threshold = extractor.default_threshold if threshold is None or threshold < 0 else threshold
         self.memory_seconds = memory_seconds     # 0 = remember for as long as the program runs
         self.bank_size = bank_size
         self.margin = margin
+        self.max_speed = max_speed
+        self.position_slack = position_slack
         self.reset()
 
     def reset(self):
         self.banks = {}        # person ID -> list of appearance features
         self.last_seen = {}    # person ID -> image time last seen (only used for memory_seconds)
+        self.positions = {}    # person ID -> (world position (x, y, z), image time) last known
 
     def __len__(self):
         return len(self.banks)
 
     def score(self, feature, person_id):
-        """How well a feature matches a person: mean of the 3 best similarities to their samples,
-        so one lucky sample doesn't decide, but a person seen from the same angle still matches."""
-        sims = sorted((self.extractor.similarity(feature, f) for f in self.banks[person_id]), reverse=True)
-        return float(np.mean(sims[:3]))
+        """How well a feature matches a person: their single most similar sample. The bank holds
+        views from different angles, so a person seen from above or behind should match their
+        sample from that angle, not an average with their front views."""
+        return max(self.extractor.similarity(feature, f) for f in self.banks[person_id])
 
-    def match(self, queries, exclude=()):
+    def reachable(self, person_id, position, stamp):
+        """False if the person was last seen too far away to be at `position` now."""
+        last = self.positions.get(person_id)
+        if position is None or last is None or stamp is None:
+            return True     # unknown: decide on appearance alone
+        (lx, ly, _), seen_at = last
+        distance = float(np.hypot(position[0] - lx, position[1] - ly))   # horizontal only
+        return distance <= self.max_speed * max(0.0, stamp - seen_at) + self.position_slack
+
+    def match(self, queries, exclude=(), positions=None, stamp=None):
         """queries: {key: feature or None}. Returns {key: (person_id or None, best_score, best_id)}.
 
         One-to-one: each remembered person is given to at most one query, best scores first, and
-        people in `exclude` (in view right now) are never candidates.
+        people in `exclude` (in view right now) are never candidates. positions: {key: world
+        position or None} of each query at image time `stamp`, to rule out people too far away.
         """
         candidates = [p for p in self.banks if p not in exclude]
+        positions = positions or {}
         scored = {}
         for key, feature in queries.items():
-            if feature is None or not candidates:
+            here = [p for p in candidates if self.reachable(p, positions.get(key), stamp)]
+            if feature is None or not here:
                 scored[key] = []
                 continue
-            scored[key] = sorted(((self.score(feature, p), p) for p in candidates), reverse=True)
+            scored[key] = sorted(((self.score(feature, p), p) for p in here), reverse=True)
 
         result = {key: (None, s[0][0] if s else None, s[0][1] if s else None) for key, s in scored.items()}
         pairs = sorted(((s, key, p) for key, lst in scored.items() for s, p in lst
@@ -212,7 +253,8 @@ class ReIdentifier:
 
     def add(self, person_id, feature, stamp):
         """Add an appearance sample for a person. Near-duplicates of an existing sample are
-        skipped so the bank keeps a variety of views; the oldest sample goes when it's full."""
+        skipped. When the bank is full, the sample most like the others goes, so the bank keeps
+        a variety of views (front, back, from above) instead of only the most recent ones."""
         self.last_seen[person_id] = stamp
         if feature is None:
             return
@@ -221,10 +263,16 @@ class ReIdentifier:
             return
         bank.append(feature)
         if len(bank) > self.bank_size:
-            bank.pop(0)
+            # Redundancy of each sample: how alike it is to its closest other sample.
+            redundancy = [max(self.extractor.similarity(f, g) for j, g in enumerate(bank) if j != i)
+                          for i, f in enumerate(bank)]
+            bank.pop(int(np.argmax(redundancy)))
 
-    def seen(self, person_id, stamp):
+    def seen(self, person_id, stamp, position=None):
+        """A person is in view at image time `stamp`, at a world position if known."""
         self.last_seen[person_id] = stamp
+        if position is not None:
+            self.positions[person_id] = (tuple(position), stamp)
 
     def expire(self, stamp):
         """Forget people not seen for memory_seconds (only if memory_seconds > 0)."""
@@ -233,6 +281,7 @@ class ReIdentifier:
         for person_id, seen_at in list(self.last_seen.items()):
             if stamp - seen_at > self.memory_seconds:
                 self.banks.pop(person_id, None)
+                self.positions.pop(person_id, None)
                 del self.last_seen[person_id]
 
 

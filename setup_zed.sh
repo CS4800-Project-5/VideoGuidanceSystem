@@ -24,7 +24,9 @@ echo "ok"
 
 step "System packages"
 need=()
-for p in python3-venv ros-humble-cv-bridge ros-humble-rosbag2; do
+# vision_msgs: the /perception/tracks topics; tf2-ros-py: world positions (world_frame).
+for p in python3-venv ros-humble-cv-bridge ros-humble-rosbag2 ros-humble-vision-msgs \
+         ros-humble-tf2-ros-py; do
     dpkg -s "$p" >/dev/null 2>&1 || need+=("$p")
 done
 if [ ${#need[@]} -gt 0 ]; then
@@ -64,11 +66,11 @@ if [ ! -x "$VENV/bin/python" ]; then
     "$VENV/bin/pip" install torch torchvision --index-url https://download.pytorch.org/whl/cpu
     "$VENV/bin/pip" install ultralytics opencv-python "numpy<2"
 fi
-# lap: needed by ByteTrack. Ultralytics would otherwise try to download it the first time the
+# lap: needed by the BoT-SORT tracker. Ultralytics would otherwise try to download it the first time the
 # node runs, which fails without internet (e.g. in class).
 "$VENV/bin/pip" install -q "lap>=0.5.12" "numpy<2"
 source /opt/ros/humble/setup.bash
-"$VENV/bin/python" -c "import rclpy, cv_bridge, ultralytics, lap, cv2; print('ok')"
+"$VENV/bin/python" -c "import rclpy, cv_bridge, ultralytics, lap, cv2, vision_msgs.msg, tf2_ros; print('ok')"
 
 step "YOLO models (saved in the repo folder, so no download is needed later)"
 (cd "$HERE" && "$VENV/bin/python" -c "
@@ -76,35 +78,41 @@ from ultralytics import YOLO
 import numpy as np
 # yolov8n.pt: simulation default; yolo11s.pt: zed-demo default.
 for weights in ('yolov8n.pt', 'yolo11s.pt'):
-    for tracker in ('bytetrack_occlusion.yaml', 'botsort_zed.yaml'):
+    for tracker in ('botsort_zed.yaml', 'botsort_sim.yaml'):
         YOLO(weights).track(np.zeros((376, 672, 3), np.uint8), persist=True,
                             tracker=tracker, verbose=False)
 print('ok: yolov8n.pt, yolo11s.pt and the trackers work')
 ")
 
-step "Person re-identification model (OSNet, from torchreid's model zoo on Google Drive)"
-# osnet_x0_5 trained on MSMT17 (all splits, for use in new places), from
+step "Person re-identification models (OSNet, from torchreid's model zoo on Google Drive)"
+# Both trained on MSMT17 (all splits, for use in new places), from
 # https://github.com/KaiyangZhou/deep-person-reid/blob/master/docs/MODEL_ZOO.md
-REID_WEIGHTS="$HERE/osnet_x0_5_msmt17.pth"
-REID_DRIVE_ID="1DHgmb6XV4fwG3n-CnCM0zdL9nMsZ9_RF"
-if [ ! -s "$REID_WEIGHTS" ]; then
-    "$VENV/bin/pip" install -q gdown
-    "$VENV/bin/gdown" --quiet "https://drive.google.com/uc?id=$REID_DRIVE_ID" -O "$REID_WEIGHTS" \
-        || rm -f "$REID_WEIGHTS"
-fi
-if (cd "$HERE" && "$VENV/bin/python" -c "
+#   osnet_x0_5:     small and fast; the default on a CPU (laptop, VM).
+#   osnet_ibn_x1_0: full size, copes better with new places, lighting and viewpoints, but about
+#                   10x the CPU time; the default with device:=cuda (the Jetson's GPU).
+for model in "osnet_x0_5 1DHgmb6XV4fwG3n-CnCM0zdL9nMsZ9_RF" "osnet_ibn_x1_0 1q3Sj2ii34NlfxA4LvmHdWO_75NDRmECJ"; do
+    set -- $model
+    REID_WEIGHTS="$HERE/${1}_msmt17.pth"
+    REID_DRIVE_ID="$2"
+    if [ ! -s "$REID_WEIGHTS" ]; then
+        "$VENV/bin/pip" install -q gdown
+        "$VENV/bin/gdown" --quiet "https://drive.google.com/uc?id=$REID_DRIVE_ID" -O "$REID_WEIGHTS" \
+            || rm -f "$REID_WEIGHTS"
+    fi
+    if (cd "$HERE" && "$VENV/bin/python" -c "
 from reidentifier import OSNetExtractor
 import numpy as np
 f = OSNetExtractor('$REID_WEIGHTS').extract(np.zeros((256, 128, 3), np.uint8))
 assert f is not None and f.shape == (512,)
-print('ok: OSNet re-identification model works')
+print('ok: OSNet re-identification model $1 works')
 "); then :
-else
-    echo "Could not download or load the OSNet weights. Re-identification will use clothing colors"
-    echo "instead (less accurate). To fix: download the osnet_x0_5 MSMT17 'combineall' model from"
-    echo "  https://drive.google.com/file/d/$REID_DRIVE_ID/view"
-    echo "save it as $REID_WEIGHTS, and run this script again."
-fi
+    else
+        echo "Could not download or load the $1 weights. Re-identification falls back to the other"
+        echo "OSNet model, or to clothing colors (less accurate). To fix: download the $1 MSMT17"
+        echo "'combineall' model from https://drive.google.com/file/d/$REID_DRIVE_ID/view"
+        echo "save it as $REID_WEIGHTS, and run this script again."
+    fi
+done
 
 step "ZED factory calibration"
 if PYTHONNOUSERSITE=1 python3 - "$PROJ1/zed_usb" <<'EOF'
@@ -143,10 +151,10 @@ else
     echo "Note: ~/yolo_camera_node.py is a copy, not a link, so sim-demo runs that copy."
     echo "To run this repo's node instead: ln -sf $HERE/yolo_camera_node.py ~/yolo_camera_node.py"
 fi
-SIM_ARGS="tracker:=botsort"
+SIM_ARGS=""
 # Gazebo's 3D rendering crashes on a VM's virtual graphics card (README, "Running in a VMware").
 if [ "$(systemd-detect-virt 2>/dev/null || true)" != "none" ]; then
-    SIM_ARGS="$SIM_ARGS software_render:=true"
+    SIM_ARGS="software_render:=true"
 fi
 LINE="alias sim-demo='source /opt/ros/humble/setup.bash && ros2 launch $HERE/sim.launch.py $SIM_ARGS'"
 sed -i '/^alias sim-demo=/d' ~/.bashrc

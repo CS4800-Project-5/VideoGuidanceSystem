@@ -1,7 +1,7 @@
 # BoT-SORT config for the real ZED camera (zed.launch.py). Ultralytics defaults, except as noted.
 # Docs: https://docs.ultralytics.com/modes/track
 #
-# Why not bytetrack_occlusion.yaml here: ByteTrack assumes the camera holds still. A handheld
+# Why BoT-SORT and not ByteTrack: ByteTrack assumes the camera holds still. A handheld
 # camera (or the drone) moving at a few frames per second shifts everyone far between frames, so
 # ByteTrack loses them and starts new IDs. BoT-SORT's global motion compensation (gmc_method)
 # estimates the camera's own motion from the background and corrects for it.

@@ -8,12 +8,21 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rcl_interfaces.msg import ParameterDescriptor
+from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from ultralytics import YOLO
 
+try:
+    from tf2_ros import Buffer, TransformListener
+except ImportError:   # tf2_ros missing: no world positions, re-ID on appearance only
+    Buffer = TransformListener = None
+
 from reidentifier import ReIdentifier, make_extractor, mean_feature
+from track_publisher import TrackPublisher
+from tracking_logger import TrackingLogger
 
 
 # Default camera: the Gazebo simulation. zed.launch.py sets camera_topic and depth_topic
@@ -25,8 +34,10 @@ CAMERA_TOPIC = (
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 
-# The tracker config sits next to this file in the repo, so the path works on any machine.
-TRACKER_CONFIG = os.path.join(HERE, "bytetrack_occlusion.yaml")
+# BoT-SORT settings. The tracker config sits next to this file in the repo, so the path works on
+# any machine. BoT-SORT compensates for the camera's own motion (handheld, or on the drone);
+# sim.launch.py passes botsort_sim.yaml instead.
+TRACKER_CONFIG = os.path.join(HERE, "botsort_zed.yaml")
 
 
 def box_overlap(box, others):
@@ -79,26 +90,43 @@ class YoloCameraNode(Node):
         # "sensor_data" (best effort) for Gazebo; "reliable" for the ZED, whose ~1 MB images
         # get dropped whole over best effort.
         camera_qos = self.declare_parameter("camera_qos", "sensor_data").value
+        # Camera intrinsics (sensor_msgs/CameraInfo) for the color image. With depth, they turn
+        # each person's box and distance into a 3D position for the tracks_3d topic. Empty = no
+        # 3D positions. zed.launch.py sets the ZED's rgb/color/rect/camera_info.
+        self.camera_info_topic = self.declare_parameter("camera_info_topic", "").value
+        self.camera_info = None
+        # Fixed frame (e.g. "map" or "odom") that TF connects to the camera's frame. With it, each
+        # person's position is also known in that frame, which lets re-identification rule out
+        # people who were last seen too far away. Empty = off (camera-frame positions only).
+        self.world_frame = self.declare_parameter("world_frame", "").value
+        self.tf_buffer = None
+        self.tf_warned = False
+        if self.world_frame:
+            if Buffer is None:
+                self.get_logger().warn("tf2_ros is not installed, so world_frame is ignored")
+            else:
+                self.tf_buffer = Buffer()
+                self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # Run YOLO on one out of every `process_every` frames to reduce CPU usage.
-        self.process_every = max(1, int(self.declare_parameter("process_every", 3).value))
+        # Run YOLO on one out of every `process_every` frames to reduce CPU usage. BoT-SORT
+        # follows a moving camera best when it sees every frame.
+        self.process_every = max(1, int(self.declare_parameter("process_every", 1).value))
         self.imgsz = int(self.declare_parameter("imgsz", 320).value)
 
-        # ---- Tracking ----
-        # Tracker settings file. zed.launch.py uses botsort_zed.yaml, which compensates for the
-        # camera itself moving (handheld, or on the drone).
+        # ---- Tracking (BoT-SORT) ----
+        # Tracker settings file: botsort_zed.yaml by default, botsort_sim.yaml in the simulation.
         self.tracker = self.declare_parameter("tracker", TRACKER_CONFIG).value
-        # Detections below this confidence are dropped before tracking. ByteTrack/BoT-SORT are
-        # designed to get weak detections too (down to track_low_thresh, 0.1): they use them only
-        # to keep following people they already track (e.g. partly hidden), and start new IDs
-        # only above new_track_thresh. The ZED launch passes 0.1.
+        # Detections below this confidence are dropped before tracking. BoT-SORT is designed to
+        # get weak detections too (down to track_low_thresh, 0.1): it uses them only to keep
+        # following people it already tracks (e.g. partly hidden), and starts new IDs only above
+        # new_track_thresh.
         self.conf = float(self.declare_parameter(
-            "conf", 0.35, ParameterDescriptor(dynamic_typing=True)).value)
+            "conf", 0.1, ParameterDescriptor(dynamic_typing=True)).value)
         # A person gets an ID only after being tracked in this many processed frames in a row,
         # so detections that flicker for a frame or two don't use up IDs. IDs are numbered
         # 1, 2, 3, ... in the order people are confirmed (the tracker's own numbers skip
         # every short-lived candidate).
-        self.min_hits = max(1, int(self.declare_parameter("min_hits", 1).value))
+        self.min_hits = max(1, int(self.declare_parameter("min_hits", 3).value))
         self.display_ids = {}          # tracker id -> our id
         self.hits = {}                 # tracker id -> processed frames tracked so far
         self.next_display_id = 1
@@ -106,13 +134,21 @@ class YoloCameraNode(Node):
         # ---- Re-identification (reidentifier.py) ----
         # Remember what each person looks like, with no time limit, so someone who leaves the view
         # (or the camera leaving the room) gets their old ID back when they are seen again.
-        # Off by default; zed.launch.py and sim-demo turn it on.
+        # reid:=false turns it off.
         self.reid = None
-        if bool(self.declare_parameter("reid", False).value):
-            extractor = make_extractor(
-                self.declare_parameter("reid_model", os.path.join(HERE, "osnet_x0_5_msmt17.pth")).value,
-                self.get_logger(),
-            )
+        if bool(self.declare_parameter("reid", True).value):
+            # OSNet weights (setup_zed.sh downloads both; the architecture comes from the file
+            # name). Empty = by device: the small, fast osnet_x0_5 on a CPU, and the full-size
+            # osnet_ibn_x1_0 on a GPU (it copes better with new viewpoints and lighting, but
+            # takes about 10x the CPU time). Either way the other one is the fallback.
+            small = os.path.join(HERE, "osnet_x0_5_msmt17.pth")
+            large = os.path.join(HERE, "osnet_ibn_x1_0_msmt17.pth")
+            reid_model = self.declare_parameter("reid_model", "").value
+            on_gpu = str(self.device).lower() not in ("cpu", "")
+            candidates = [reid_model] if reid_model else []
+            candidates += [large, small] if on_gpu else [small, large]
+            extractor = make_extractor(candidates, self.get_logger(),
+                                       device="cuda" if on_gpu else "cpu")
             self.reid = ReIdentifier(
                 extractor,
                 # Similarity needed to count as the same person; -1 = the model's default
@@ -123,9 +159,17 @@ class YoloCameraNode(Node):
                 # Seconds to remember someone who is gone; 0 = for as long as the program runs.
                 memory_seconds=float(self.declare_parameter(
                     "reid_memory", 0.0, ParameterDescriptor(dynamic_typing=True)).value),
+                # With world_frame: fastest a person is assumed to move (m/s). A remembered person
+                # last seen farther away than they could have walked is not a candidate.
+                max_speed=float(self.declare_parameter(
+                    "reid_max_speed", 3.0, ParameterDescriptor(dynamic_typing=True)).value),
             )
             # Add a new appearance sample of each person every this many processed frames.
             self.reid_every = max(1, int(self.declare_parameter("reid_every", 5).value))
+            # Only samples with at least this YOLO confidence are added. Kept low so views from
+            # above or behind (where YOLO is less sure) still get remembered.
+            self.reid_min_conf = float(self.declare_parameter(
+                "reid_min_conf", 0.3, ParameterDescriptor(dynamic_typing=True)).value)
         self.track_features = {}       # tracker id -> appearance samples while being confirmed
         self.since_sample = {}         # tracker id -> processed frames since its last sample
         self.reid_events = {}          # our id -> (how, similarity, closest id), this frame
@@ -143,6 +187,16 @@ class YoloCameraNode(Node):
         self.model.add_callback("on_predict_postprocess_end", self.count_detections)
         self.frame_count = 0
 
+        # ---- Output for other groups and for analysis ----
+        # ROS topics with every tracked person and entered/left events (track_publisher.py).
+        self.publisher = TrackPublisher(
+            self, self.declare_parameter("topic_prefix", "/perception").value)
+        # CSV file with the same detections and events (tracking_logger.py). Empty = no CSV.
+        csv_log = self.declare_parameter("csv_log", "~/yolo_tracking_log.csv").value
+        self.csv = TrackingLogger(csv_log) if csv_log else None
+        if self.csv is not None:
+            self.get_logger().info(f"Logging detections and events to {self.csv.log_path}")
+
         # Entry/exit tracking state.
         # A track is stale once it has not been seen for stale_timeout seconds.
         # Time comes from the image timestamps, so it works the same in live
@@ -157,7 +211,7 @@ class YoloCameraNode(Node):
         self.last_stamp = None         # time of the most recent image (seconds)
         self.last_frame_wall = None    # wall clock time the most recent image arrived
 
-        # Processed frames per second, measured from image timestamps. Used to keep ByteTrack's
+        # Processed frames per second, measured from image timestamps. Used to keep BoT-SORT's
         # memory equal to stale_timeout (see set_track_buffer).
         self.fps = 0.0
         self.last_processed_stamp = None
@@ -180,6 +234,8 @@ class YoloCameraNode(Node):
         )
         if self.depth_topic:
             self.create_subscription(Image, self.depth_topic, self.depth_callback, qos)
+        if self.camera_info_topic:
+            self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, qos)
 
         # If the camera stops sending images, image time stops moving and
         # tracks would never go stale. This timer catches that case.
@@ -237,8 +293,55 @@ class YoloCameraNode(Node):
             self.pending = None
             self.process_image(pending, message)
 
+    def camera_info_callback(self, message):
+        self.camera_info = message
+
+    def camera_point(self, box, meters, image_width):
+        """3D position (x right, y down, z forward, in m) of a person's torso in the camera's
+        optical frame, and their approximate (width, height, depth) in m, from the box, the
+        distance and the camera intrinsics. (None, None) without a distance or intrinsics."""
+        info = self.camera_info
+        if meters is None or info is None or info.k[0] <= 0:
+            return None, None
+        # The intrinsics are for info.width pixels; scale them if the image has another size.
+        scale = image_width / info.width if info.width else 1.0
+        fx, fy = info.k[0] * scale, info.k[4] * scale
+        cx, cy = info.k[2] * scale, info.k[5] * scale
+        x1, y1, x2, y2 = box
+        u, v = (x1 + x2) / 2, y1 + 0.4 * (y2 - y1)   # torso center, where the distance is measured
+        width, height = (x2 - x1) * meters / fx, (y2 - y1) * meters / fy
+        position = ((u - cx) * meters / fx, (v - cy) * meters / fy, meters)
+        return position, (width, height, min(width, 0.5))
+
+    def to_world(self, header, position):
+        """A camera-frame position in world_frame (via TF), or None if unknown."""
+        if self.tf_buffer is None or position is None or not header.frame_id:
+            return None
+        try:
+            try:
+                t = self.tf_buffer.lookup_transform(self.world_frame, header.frame_id,
+                                                    Time.from_msg(header.stamp))
+            except Exception:
+                # The image may be newer than the last transform: use the latest one.
+                t = self.tf_buffer.lookup_transform(self.world_frame, header.frame_id, Time(),
+                                                    timeout=Duration(seconds=0))
+        except Exception as error:
+            if not self.tf_warned:
+                self.tf_warned = True
+                self.get_logger().warn(f"No transform {header.frame_id} -> {self.world_frame} "
+                                       f"({error}); re-ID matches on appearance only until there is")
+            return None
+        q, tr = t.transform.rotation, t.transform.translation
+        # Rotate the point by the quaternion (v' = v + 2w(q x v) + 2 q x (q x v)), then translate.
+        v = np.array(position, float)
+        u = np.array([q.x, q.y, q.z])
+        c = np.cross(u, v)
+        v = v + 2 * q.w * c + 2 * np.cross(u, c)
+        return (v[0] + tr.x, v[1] + tr.y, v[2] + tr.z)
+
     def process_image(self, message, depth_message):
         stamp = self.stamp_of(message)
+        started = time.perf_counter()
 
         try:
             frame = self.bridge.imgmsg_to_cv2(
@@ -249,7 +352,7 @@ class YoloCameraNode(Node):
             if depth_message is not None:
                 depth = self.bridge.imgmsg_to_cv2(depth_message, desired_encoding="passthrough")
 
-            # YOLO detects people; the tracker (ByteTrack or BoT-SORT) assigns persistent IDs.
+            # YOLO detects people; BoT-SORT follows them from frame to frame.
             results = self.model.track(
                 frame,
                 tracker=self.tracker,
@@ -262,12 +365,28 @@ class YoloCameraNode(Node):
             )
             self.set_track_buffer(stamp)
 
-            # (our id, box, confidence, distance in m or None) for each confirmed person
-            people = self.confirmed_people(results[0].boxes, depth, frame, stamp)
+            # (our id, box, confidence, distance in m, camera-frame position, size), the last
+            # three None when unknown, for each confirmed person
+            people = self.confirmed_people(results[0].boxes, depth, frame, stamp, message.header)
             current_ids = {person[0] for person in people}
             boxes = results[0].boxes
             tracked = 0 if boxes is None or boxes.id is None else len(boxes.id)
             self.log_status(tracked, len(people))
+
+            # Publish every person (with a 3D position when depth and intrinsics are known),
+            # and log them to the CSV file.
+            with_3d = depth is not None and self.camera_info is not None
+            published = [(person_id, box, confidence, position, size)
+                         for person_id, box, confidence, _, position, size in people]
+            self.publisher.publish_frame(message.header, published, with_3d)
+            processing_ms = (time.perf_counter() - started) * 1000
+            if self.csv is not None:
+                for person_id, box, confidence, position, _ in published:
+                    self.csv.log_detection(self.frame_count, person_id, 0, "person", confidence,
+                                           box, processing_ms, stamp=stamp, position=position)
+                if not published:
+                    self.csv.log_frame_without_detections(self.frame_count, processing_ms,
+                                                          stamp=stamp)
 
             # A newly observed ID means that an object entered the view.
             for track_id in current_ids:
@@ -275,16 +394,16 @@ class YoloCameraNode(Node):
                     self.get_logger().info(
                         f"Object entered camera view: ID {track_id}{self.reid_note(track_id)}"
                     )
+                    self.track_event("entered", track_id, stamp, processing_ms)
 
                 self.last_seen[track_id] = stamp
 
             # Remove tracks that have not been seen for stale_timeout seconds.
             for track_id, seen_at in list(self.last_seen.items()):
                 if stamp - seen_at > self.stale_timeout:
-                    self.get_logger().info(
-                        f"Object left camera view: ID {track_id} "
-                        f"(unseen for {stamp - seen_at:.1f}s)"
-                    )
+                    reason = f"unseen for {stamp - seen_at:.1f}s"
+                    self.get_logger().info(f"Object left camera view: ID {track_id} ({reason})")
+                    self.track_event("left", track_id, stamp, processing_ms, reason)
                     del self.last_seen[track_id]
                     self.forget(track_id)
 
@@ -299,6 +418,20 @@ class YoloCameraNode(Node):
             self.get_logger().error(
                 f"Image processing error: {error}"
             )
+            if self.csv is not None:
+                self.csv.log_processing_error(self.frame_count, error)
+
+    def track_event(self, event, display_id, stamp, processing_ms="", reason=None):
+        """An entered/left event on the track_events topic and in the CSV file."""
+        how, score, _ = self.reid_events.get(display_id, (None, None, None))
+        if event != "entered":
+            how = score = None
+        self.publisher.publish_event(
+            event, display_id, stamp, reason=reason, how=how,
+            similarity=None if score is None or how != "reidentified" else round(score, 3))
+        if self.csv is not None:
+            self.csv.log_tracking_event(self.frame_count, event, display_id, processing_ms,
+                                        stamp=stamp)
 
     def reid_note(self, display_id):
         """How re-identification decided an ID, for the entered log line."""
@@ -332,7 +465,7 @@ class YoloCameraNode(Node):
             + (f", remembering {len(self.reid)} people" if self.reid is not None else "")
         )
 
-    def confirmed_people(self, boxes, depth, frame, stamp):
+    def confirmed_people(self, boxes, depth, frame, stamp, header):
         """The tracker's results with our IDs: only people tracked for min_hits frames in a row.
 
         With re-identification, a newly confirmed track is first compared with every remembered
@@ -343,6 +476,13 @@ class YoloCameraNode(Node):
         if boxes is not None and boxes.id is not None:
             rows = list(zip(boxes.id.int().cpu().tolist(), boxes.xyxy.cpu().tolist(),
                             boxes.conf.cpu().tolist()))
+
+        # Where each tracked person is: distance, camera-frame position and size, world position.
+        where = {}
+        for tracker_id, box, _ in rows:
+            meters = person_distance(depth, box) if depth is not None else None
+            position, size = self.camera_point(box, meters, frame.shape[1])
+            where[tracker_id] = (meters, position, size, self.to_world(header, position))
 
         # 1. Which tracks already have an ID, and which reach min_hits now.
         visible, confirming = set(), []
@@ -363,7 +503,9 @@ class YoloCameraNode(Node):
             matches = {}
             if self.reid is not None:
                 queries = {t: mean_feature(self.track_features.get(t, [])) for t in confirming}
-                matches = self.reid.match(queries, exclude=visible)
+                matches = self.reid.match(queries, exclude=visible,
+                                          positions={t: where[t][3] for t in confirming},
+                                          stamp=stamp)
             for tracker_id in confirming:
                 person_id, score, closest = matches.get(tracker_id, (None, None, None))
                 if person_id is None:
@@ -389,10 +531,10 @@ class YoloCameraNode(Node):
             if tracker_id not in self.display_ids:
                 continue
             person_id = self.display_ids[tracker_id]
+            meters, position, size, world = where[tracker_id]
             if self.reid is not None:
-                self.reid.seen(person_id, stamp)
-            meters = person_distance(depth, box) if depth is not None else None
-            people.append((person_id, box, confidence, meters))
+                self.reid.seen(person_id, stamp, world)
+            people.append((person_id, box, confidence, meters, position, size))
 
         # Candidates must be seen in consecutive frames to count.
         for tracker_id in list(self.hits):
@@ -412,8 +554,8 @@ class YoloCameraNode(Node):
                 self.since_sample[tracker_id] = self.since_sample.get(tracker_id, self.reid_every) + 1
                 # A clear view only: confident, and not overlapping someone else (whose clothes
                 # would end up in this person's sample).
-                if (self.since_sample[tracker_id] < self.reid_every or confidence < 0.5
-                        or box_overlap(box, others) > 0.2):
+                if (self.since_sample[tracker_id] < self.reid_every
+                        or confidence < self.reid_min_conf or box_overlap(box, others) > 0.2):
                     continue
                 self.since_sample[tracker_id] = 0
             elif box_overlap(box, others) > 0.5:
@@ -443,7 +585,7 @@ class YoloCameraNode(Node):
     def draw(frame, people, with_depth):
         """Boxes with our IDs (one color per ID), confidence and, with depth, the distance."""
         image = frame.copy()
-        for display_id, (x1, y1, x2, y2), confidence, meters in people:
+        for display_id, (x1, y1, x2, y2), confidence, meters, *_ in people:
             hue = (display_id * 47) % 180
             color = tuple(int(c) for c in cv2.cvtColor(
                 np.uint8([[[hue, 220, 230]]]), cv2.COLOR_HSV2BGR)[0, 0])
@@ -463,9 +605,9 @@ class YoloCameraNode(Node):
         return image
 
     def set_track_buffer(self, stamp):
-        """Keep ByteTrack's memory of a hidden object equal to stale_timeout seconds.
+        """Keep BoT-SORT's memory of a hidden object equal to stale_timeout seconds.
 
-        ByteTrack counts how long an object has been gone in processed frames (track_buffer),
+        BoT-SORT counts how long an object has been gone in processed frames (track_buffer),
         but the frame rate differs a lot between the sim, a laptop and the Jetson. Converting
         stale_timeout to frames from the measured rate means an object that comes back within
         stale_timeout keeps its ID on any machine.
@@ -498,10 +640,11 @@ class YoloCameraNode(Node):
             self.get_logger().info(
                 f"Object left camera view: ID {track_id} ({reason})"
             )
+            self.track_event("left", track_id, self.last_stamp or 0.0, reason=reason)
         self.last_seen.clear()
 
     def reset_tracker(self):
-        # Clear ByteTrack's memory so old IDs cannot come back. IDs restart at 1.
+        # Clear BoT-SORT's memory so old IDs cannot come back. IDs restart at 1.
         predictor = getattr(self.model, "predictor", None)
         for tracker in getattr(predictor, "trackers", None) or []:
             tracker.reset()
@@ -525,6 +668,8 @@ def main(args=None):
         pass
     finally:
         cv2.destroyAllWindows()
+        if node.csv is not None:
+            node.csv.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

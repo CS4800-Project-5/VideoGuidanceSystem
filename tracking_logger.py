@@ -2,6 +2,7 @@
 This module is intentionally separate from the ROS 2 camera node so it can be
 reviewed and maintained as needed. It does not create ROS topics or perform
 object detection; the camera node calls these methods with the results.
+The same detections and events are published as ROS topics by track_publisher.py.
 """
 
 import csv
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 
 CSV_FIELDS = [
     "timestamp_utc",
+    "image_stamp",
     "frame_count",
     "record_type",
     "event",
@@ -22,6 +24,9 @@ CSV_FIELDS = [
     "y1",
     "x2",
     "y2",
+    "x_m",
+    "y_m",
+    "z_m",
     "processing_ms",
 ]
 
@@ -29,6 +34,11 @@ CSV_FIELDS = [
 def utc_timestamp():
     """Return the current time in UTC as an ISO-8601 string."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _stamp(stamp):
+    """Image time in seconds for the CSV (blank if unknown)."""
+    return "" if stamp is None else round(float(stamp), 3)
 
 
 class TrackingLogger:
@@ -49,6 +59,12 @@ class TrackingLogger:
             not os.path.exists(self.log_path)
             or os.path.getsize(self.log_path) == 0
         )
+        if not file_is_empty and not self._has_current_header():
+            # Written with older columns: keep it, and start a new file with the current ones.
+            root, extension = os.path.splitext(self.log_path)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            os.rename(self.log_path, f"{root}.before-{stamp}{extension or '.csv'}")
+            file_is_empty = True
         self._file = open(
             self.log_path, "a", newline="", encoding="utf-8"
         )
@@ -59,6 +75,10 @@ class TrackingLogger:
         if file_is_empty:
             self._writer.writeheader()
         self._file.flush()
+
+    def _has_current_header(self):
+        with open(self.log_path, newline="", encoding="utf-8") as existing:
+            return next(csv.reader(existing), []) == CSV_FIELDS
 
     def write(self, **values):
         """Write one record, filling any unspecified CSV columns with blanks."""
@@ -81,9 +101,17 @@ class TrackingLogger:
         confidence,
         xyxy,
         processing_ms,
+        stamp=None,
+        position=None,
     ):
-        """Record one YOLO detection and its optional ByteTrack ID."""
+        """Record one YOLO detection and its optional tracker ID.
+
+        stamp: the camera image's time in seconds. position: (x, y, z) in meters in the
+        camera frame, or None when the distance is unknown.
+        """
+        x_m, y_m, z_m = ("", "", "") if position is None else (round(float(v), 3) for v in position)
         self.write(
+            image_stamp=_stamp(stamp),
             frame_count=frame_count,
             record_type="detection",
             event="observed",
@@ -95,26 +123,31 @@ class TrackingLogger:
             y1=round(float(xyxy[1]), 2),
             x2=round(float(xyxy[2]), 2),
             y2=round(float(xyxy[3]), 2),
+            x_m=x_m,
+            y_m=y_m,
+            z_m=z_m,
             processing_ms=round(float(processing_ms), 3),
         )
 
-    def log_frame_without_detections(self, frame_count, processing_ms):
+    def log_frame_without_detections(self, frame_count, processing_ms, stamp=None):
         """Record a processed frame in which no detections were returned."""
         self.write(
+            image_stamp=_stamp(stamp),
             frame_count=frame_count,
             record_type="frame",
             event="no_detection",
             processing_ms=round(float(processing_ms), 3),
         )
 
-    def log_tracking_event(self, frame_count, event, track_id, processing_ms):
-        """Record a track entry or exit event."""
+    def log_tracking_event(self, frame_count, event, track_id, processing_ms, stamp=None):
+        """Record a track entry or exit event. processing_ms may be "" (not measured)."""
         self.write(
+            image_stamp=_stamp(stamp),
             frame_count=frame_count,
             record_type="tracking_event",
             event=event,
             track_id=track_id,
-            processing_ms=round(float(processing_ms), 3),
+            processing_ms="" if processing_ms == "" else round(float(processing_ms), 3),
         )
 
     def log_processing_error(self, frame_count, error):
